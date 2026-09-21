@@ -50,6 +50,7 @@ uv run audit_pg.py
 2. `--env-file <ruta>` (archivo `.env` explícito con `DATABASE_URL`).
 3. Archivo `.env` descubierto **caminando hacia arriba** desde el directorio actual.
 4. Variables de entorno estándar de libpq: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`.
+5. Variables estilo docker-compose `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT` (compatibilidad: muchos `.env` de proyectos reales las usan).
 
 Si no se encuentra ninguna configuración, el comando termina con código de salida `1`
 y un mensaje en stderr.

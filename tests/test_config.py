@@ -62,6 +62,34 @@ def test_libpq_env_minimal(monkeypatch):
     assert audit_pg.resolve_db_url(None, None) == "postgresql://localhost:5432/appdb"
 
 
+def test_postgres_env_fallback_docker_compose(monkeypatch):
+    """docker-compose style POSTGRES_* vars must work as a fallback (real-world .env pattern)."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("PGHOST", raising=False)
+    monkeypatch.delenv("PGDATABASE", raising=False)
+    monkeypatch.delenv("PGUSER", raising=False)
+    monkeypatch.setattr(audit_pg, "find_dotenv", lambda usecwd=True: "")
+    monkeypatch.setenv("POSTGRES_DB", "familiar")
+    monkeypatch.setenv("POSTGRES_USER", "app_user")
+    monkeypatch.setenv("POSTGRES_PASSWORD", "p@ss:word")
+    monkeypatch.setenv("POSTGRES_HOST", "localhost")
+    monkeypatch.setenv("POSTGRES_PORT", "5432")
+    assert audit_pg.resolve_db_url(None, None) == (
+        "postgresql://app_user:p%40ss%3Aword@localhost:5432/familiar"
+    )
+
+
+def test_libpq_wins_over_postgres_env(monkeypatch):
+    """Standard libpq PG* vars take precedence over the POSTGRES_* fallback."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(audit_pg, "find_dotenv", lambda usecwd=True: "")
+    monkeypatch.setenv("PGHOST", "db.std")
+    monkeypatch.setenv("PGDATABASE", "stddb")
+    monkeypatch.setenv("POSTGRES_DB", "composedb")
+    monkeypatch.setenv("POSTGRES_HOST", "db.compose")
+    assert audit_pg.resolve_db_url(None, None) == "postgresql://db.std:5432/stddb"
+
+
 def test_missing_config_returns_none(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("PGHOST", raising=False)
@@ -69,5 +97,10 @@ def test_missing_config_returns_none(monkeypatch):
     monkeypatch.delenv("PGUSER", raising=False)
     monkeypatch.delenv("PGPORT", raising=False)
     monkeypatch.delenv("PGPASSWORD", raising=False)
+    monkeypatch.delenv("POSTGRES_DB", raising=False)
+    monkeypatch.delenv("POSTGRES_HOST", raising=False)
+    monkeypatch.delenv("POSTGRES_USER", raising=False)
+    monkeypatch.delenv("POSTGRES_PASSWORD", raising=False)
+    monkeypatch.delenv("POSTGRES_PORT", raising=False)
     monkeypatch.setattr(audit_pg, "find_dotenv", lambda usecwd=True: "")
     assert audit_pg.resolve_db_url(None, None) is None

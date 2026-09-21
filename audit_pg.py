@@ -397,6 +397,20 @@ def _build_libpq_url() -> str | None:
     return f"postgresql://{auth}{host}:{port}{path}"
 
 
+def _build_postgres_env_url() -> str | None:
+    """Fallback for docker-compose style POSTGRES_* variables (e.g. spinned from .env)."""
+    dbname = os.getenv("POSTGRES_DB")
+    if not dbname:
+        return None
+
+    user = quote_plus(os.getenv("POSTGRES_USER") or "")
+    password = quote_plus(os.getenv("POSTGRES_PASSWORD") or "")
+    host = os.getenv("POSTGRES_HOST") or "localhost"
+    port = os.getenv("POSTGRES_PORT") or "5432"
+    auth = f"{user}:{password}@" if user or password else ""
+    return f"postgresql://{auth}{host}:{port}/{quote_plus(dbname)}"
+
+
 def resolve_db_url(cli_url: str | None, env_file: str | None = None) -> str | None:
     if cli_url:
         return cli_url
@@ -414,7 +428,7 @@ def resolve_db_url(cli_url: str | None, env_file: str | None = None) -> str | No
         if db_url:
             return db_url
 
-    return _build_libpq_url()
+    return _build_libpq_url() or _build_postgres_env_url()
 
 
 def parse_checks(raw: str | None) -> list[str] | None:
