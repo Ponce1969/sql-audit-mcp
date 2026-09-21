@@ -54,6 +54,7 @@ def test_parser_defaults():
     assert args.min_hot_ratio == 30.0
     assert args.min_updates == 50
     assert args.max_rw_ratio == 0.05
+    assert args.min_table_rows == 10000
 
 
 def test_parser_quiet():
@@ -72,7 +73,7 @@ def test_exit_0_when_clean():
 
 def test_exit_2_when_issues():
     report = DatabaseHealthReport(
-        hot_issues=[HotUpdateIssue("orders", 100, 10, 10.0, 100, True)]
+        hot_issues=[HotUpdateIssue("orders", 100, 10, 10.0, 100, True, 50000, "12 MB")]
     )
     code = audit_pg.main(
         ["--url", "postgresql://u:p@localhost:5432/db"],
@@ -96,7 +97,7 @@ def test_exit_1_when_no_config(capsys, monkeypatch):
 
 def test_json_output_is_valid_and_redacted(capsys):
     report = DatabaseHealthReport(
-        hot_issues=[HotUpdateIssue("orders", 100, 50, 50.0, 100, True)],
+        hot_issues=[HotUpdateIssue("orders", 100, 50, 50.0, 100, True, 50000, "12 MB")],
         redundant_indexes=[
             RedundantIndexIssue("users", "idx_users_a", "16 kB", "idx_users_b", "def a", "def b")
         ],
@@ -118,7 +119,7 @@ def test_json_output_is_valid_and_redacted(capsys):
 
 def test_quiet_output_shape(capsys):
     report = DatabaseHealthReport(
-        hot_issues=[HotUpdateIssue("orders", 100, 10, 10.0, 100, True)]
+        hot_issues=[HotUpdateIssue("orders", 100, 10, 10.0, 100, True, 50000, "12 MB")]
     )
     code = audit_pg.main(
         ["--url", "postgresql://u:p@localhost:5432/db", "--quiet"],
@@ -160,12 +161,19 @@ def test_flags_flow_to_auditor():
     assert seen["checks"] == ["hot"]
     assert seen["schemas"] == ["public", "analytics"]
     assert seen["min_size_bytes"] == 512
+    assert seen["min_table_rows"] == 10000
 
 
 def test_invalid_check_exits_1(capsys):
     code = audit_pg.main(["--url", "postgresql://u:p@localhost/db", "--checks", "bogus"])
     assert code == 1
     assert "bogus" in capsys.readouterr().err
+
+
+def test_min_table_rows_negative_exits_1(capsys):
+    code = audit_pg.main(["--url", "postgresql://u:p@localhost/db", "--min-table-rows", "-1"])
+    assert code == 1
+    assert "must be >= 0" in capsys.readouterr().err
 
 
 def test_connection_error_exits_1(capsys):

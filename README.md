@@ -70,6 +70,7 @@ y un mensaje en stderr.
 | `--min-hot-ratio` | Ratio HOT mínimo aceptable (porcentaje). | `30.0` |
 | `--min-updates` | Actualizaciones mínimas para considerar una tabla en el análisis HOT. | `50` |
 | `--max-rw-ratio` | Ratio lectura/escritura máximo para marcar un índice como de poco uso. | `0.05` |
+| `--min-table-rows` | Solo reporta issues de `hot` y `low-usage` para tablas con al menos N filas vivas; `0` desactiva el umbral. | `10000` |
 
 ### Códigos de salida
 
@@ -117,12 +118,18 @@ sql-audit --json
         "size": "32 kB",
         "index_scans": 3,
         "table_writes": 5000,
-        "read_write_ratio": 0.0006
+        "read_write_ratio": 0.0006,
+        "table_rows": 50000,
+        "table_size": "12 MB"
       }
     ]
   }
 }
 ```
+
+Los issues `hot` y `low-usage` incluyen además el contexto de tabla `table_rows` (filas
+vivas estimadas) y `table_size` (tamaño total de la tabla), para distinguir tablas micro
+(ruido) de hallazgos reales.
 
 ## Desarrollo
 

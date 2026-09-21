@@ -44,6 +44,8 @@ class HotUpdateIssue:
     hot_ratio_pct: float
     fillfactor: int
     fillfactor_warning: bool
+    table_rows: int
+    table_size: str
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,8 @@ class LowUsageIndexIssue:
     index_scans: int
     table_writes: int
     read_write_ratio: float
+    table_rows: int
+    table_size: str
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,7 @@ class PostgresHealthAuditor:
         checks: list[str] | None = None,
         schemas: list[str] | None = None,
         min_size_bytes: int = 0,
+        min_table_rows: int = 10000,
     ) -> DatabaseHealthReport:
         if not HAS_PSYCOPG2:
             raise RuntimeError("psycopg2 is not installed. Run: uv add psycopg2-binary")
@@ -111,13 +116,13 @@ class PostgresHealthAuditor:
 
                 if "hot" in selected:
                     hot_issues = self._audit_hot_and_fillfactor(
-                        cur, min_hot_ratio_pct, min_updates_threshold, schemas
+                        cur, min_hot_ratio_pct, min_updates_threshold, schemas, min_table_rows
                     )
                 if "redundant" in selected:
                     redundant_indexes = self._audit_redundant_indexes(cur, schemas, min_size_bytes)
                 if "low-usage" in selected:
                     low_usage = self._audit_low_usage_indexes(
-                        cur, max_rw_ratio, schemas, min_size_bytes
+                        cur, max_rw_ratio, schemas, min_size_bytes, min_table_rows
                     )
 
                 return DatabaseHealthReport(
@@ -129,7 +134,12 @@ class PostgresHealthAuditor:
             conn.close()
 
     def _audit_hot_and_fillfactor(
-        self, cur: Any, min_ratio: float, min_updates: int, schemas: list[str] | None
+        self,
+        cur: Any,
+        min_ratio: float,
+        min_updates: int,
+        schemas: list[str] | None,
+        min_table_rows: int,
     ) -> list[HotUpdateIssue]:
         query = """
         SELECT
@@ -144,14 +154,17 @@ class PostgresHealthAuditor:
                     WHERE substr(opt, 1, 11) = 'fillfactor='
                     LIMIT 1
                 ), 100
-            ) AS fillfactor
+            ) AS fillfactor,
+            t.n_live_tup AS table_rows,
+            pg_size_pretty(pg_total_relation_size(t.relid)) AS table_size
         FROM pg_stat_user_tables t
         JOIN pg_class c ON c.oid = t.relid
         JOIN pg_namespace ns ON ns.oid = c.relnamespace
         WHERE t.n_tup_upd >= %s
           AND ROUND((t.n_tup_hot_upd::numeric / NULLIF(t.n_tup_upd, 0)) * 100, 2) < %s
+          AND t.n_live_tup >= %s
         """
-        params: list[Any] = [min_updates, min_ratio]
+        params: list[Any] = [min_updates, min_ratio, min_table_rows]
         if schemas:
             query += "          AND ns.nspname = ANY(%s)\n"
             params.append(schemas)
@@ -217,7 +230,12 @@ class PostgresHealthAuditor:
         return issues
 
     def _audit_low_usage_indexes(
-        self, cur: Any, max_ratio: float, schemas: list[str] | None, min_size_bytes: int
+        self,
+        cur: Any,
+        max_ratio: float,
+        schemas: list[str] | None,
+        min_size_bytes: int,
+        min_table_rows: int,
     ) -> list[LowUsageIndexIssue]:
         query = """
         SELECT
@@ -228,7 +246,9 @@ class PostgresHealthAuditor:
             (t.n_tup_ins + t.n_tup_upd + t.n_tup_del) AS table_writes,
             ROUND(
                 i.idx_scan::numeric / NULLIF(t.n_tup_ins + t.n_tup_upd + t.n_tup_del, 0), 4
-            ) AS read_write_ratio
+            ) AS read_write_ratio,
+            t.n_live_tup AS table_rows,
+            pg_size_pretty(pg_total_relation_size(t.relid)) AS table_size
         FROM pg_stat_user_indexes i
         JOIN pg_stat_user_tables t ON i.relid = t.relid
         JOIN pg_index idx ON idx.indexrelid = i.indexrelid
@@ -239,8 +259,9 @@ class PostgresHealthAuditor:
           AND NOT idx.indisunique
           AND (i.idx_scan::numeric / NULLIF(t.n_tup_ins + t.n_tup_upd + t.n_tup_del, 0)) < %s
           AND pg_relation_size(i.indexrelid) >= %s
+          AND t.n_live_tup >= %s
         """
-        params: list[Any] = [max_ratio, min_size_bytes]
+        params: list[Any] = [max_ratio, min_size_bytes, min_table_rows]
         if schemas:
             query += "          AND ns.nspname = ANY(%s)\n"
             params.append(schemas)
@@ -291,6 +312,9 @@ def render_text(report: DatabaseHealthReport) -> str:
                 f"    - HOT Ratio: {issue.hot_ratio_pct}% "
                 f"({issue.hot_updates} HOT / {issue.total_updates} total updates)"
             )
+            lines.append(
+                f"    - Rows: {issue.table_rows} | Table size: {issue.table_size}"
+            )
             lines.append(f"    - Fillfactor: {issue.fillfactor}%{warning}")
             if issue.fillfactor_warning:
                 lines.append(
@@ -305,7 +329,9 @@ def render_text(report: DatabaseHealthReport) -> str:
         lines.append("  -> OK: No unprofitable indexes detected.")
     else:
         for low in report.low_usage_indexes:
-            lines.append(f"  * Table: {low.table_name}")
+            lines.append(
+                f"  * Table: {low.table_name} (Rows: {low.table_rows} | Size: {low.table_size})"
+            )
             lines.append(f"    - Index: {low.index_name} (Size: {low.size})")
             lines.append(
                 f"    - Read Scans: {low.index_scans} | "
@@ -524,6 +550,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.05,
         help="Maximum read/write ratio to flag an index as low-usage (default: 0.05)",
     )
+    parser.add_argument(
+        "--min-table-rows",
+        type=int,
+        default=10000,
+        help="Only report HOT/low-usage issues for tables with at least N live rows "
+        "(default: 10000); 0 disables the threshold",
+    )
     return parser
 
 
@@ -533,6 +566,10 @@ def main(
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.min_table_rows < 0:
+        print("Error: --min-table-rows must be >= 0", file=sys.stderr)
+        return 1
 
     try:
         checks = parse_checks(args.checks)
@@ -561,6 +598,7 @@ def main(
             checks=selected_checks,
             schemas=schemas,
             min_size_bytes=args.min_size,
+            min_table_rows=args.min_table_rows,
         )
     except DatabaseConnectionError as exc:
         print(f"Connection failed: {exc}", file=sys.stderr)
