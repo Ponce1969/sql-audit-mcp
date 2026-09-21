@@ -22,9 +22,29 @@ Convierte `audit_pg.py` en una herramienta CLI instalable globalmente, usable de
 
 ## Acceptance
 
-- `uv tool install .` desde el repo → `sql-audit --help` funciona desde cualquier carpeta.
-- `sql-audit` sin args detecta `.env` de un proyecto padre (walk-up).
-- `sql-audit --json` emite JSON válido; exit code 2 cuando hay findings.
-- `sql-audit --checks hot --schema public` corre solo el check pedido y filtra por schema.
-- `uv run audit_pg.py` (PEP 723) sigue andando sin instalar.
-- mypy strict y ruff limpios; tests verdes.
+- `uv tool install .` desde el repo → `sql-audit --help` funciona desde cualquier carpeta. ✅ verificado
+- `sql-audit` sin args detecta `.env` de un proyecto padre (walk-up). ✅ verificado desde subdir anidado
+- `sql-audit --json` emite JSON válido; exit code 2 cuando hay findings. ✅ tests
+- `sql-audit --checks hot --schema public` corre solo el check pedido y filtra por schema. ✅ tests
+- `uv run audit_pg.py` (PEP 723) sigue andando sin instalar. ✅ verificado
+- mypy strict y ruff limpios; tests verdes. ✅ 24 passed
+
+## Evidencia de commits (branch `feat/sql-audit-cli`)
+
+- `e27d169` feat: add installable sql-audit CLI with config discovery, JSON output, and exit codes
+- `51a0fac` docs: document sql-audit installation, flags, exit codes and JSON output
+
+## Estado final
+
+- Instalado globalmente con `uv tool install .` (executable `sql-audit`). Desinstalar: `uv tool uninstall herraminetas-sql`.
+- `.gitignore` quedó sin commitear (cambio pre-sesión: agrega `.atl/`).
+- Push/PR quedan como decisión del usuario.
+- Riesgo conocido: los filtros SQL (`--schema`, `--min-size`) no probados contra una BD real todavía.
+
+## Prueba en terreno — Contador Oriental (C:/Users/cerra/codigo/flet)
+
+- BD real: pgvector pg16 en Docker (`auditor_familiar_db`, 127.0.0.1:5432), 25 tablas, 62 índices.
+- `sql-audit` sin flags desde el proyecto: conecta vía walk-up `.env` + fallback `POSTGRES_*`, corre las 3 auditorías.
+- Hallazgo: el `.env` del contador usa `POSTGRES_*` (patrón docker-compose) y el refactor a libpq `PG*` lo había roto → fix `2486c33`: fallback `_build_postgres_env_url()` tras libpq, bump 0.2.1, +2 tests.
+- Advertencia de interpretación: pg_stat_* se resetea al reiniciar el container (escribas totales = 0) → el 0 en HOT/low-usage es por falta de datos acumulados, no un veredicto. El 0 en redundantes sí es hallazgo real (catálogo puro).
+- Gotcha uv: `uv tool install --force .` reusó wheel caché (misma versión) → se reinstaló stale. Solución: bump de versión (0.2.1).
