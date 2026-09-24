@@ -41,6 +41,12 @@ Convierte `audit_pg.py` en una herramienta CLI instalable globalmente, usable de
 - Push/PR quedan como decisión del usuario.
 - Riesgo conocido: los filtros SQL (`--schema`, `--min-size`) no probados contra una BD real todavía.
 
+## Mejora v0.3.0 — contexto de tabla + umbral anti-falso-positivo (commit 96b448a)
+
+- Hallazgo probado en produccion: los 5 low-usage + 1 HOT eran falsos positivos por tablas micro (expenses 147 filas, ai_vector_memory 1.084). EXPLAIN confirmó Seq Scan del planner pese a que las búsquedas semánticas se ejecutan.
+- Fix: HotUpdateIssue/LowUsageIndexIssue + table_rows/table_size; queries filtran `t.n_live_tup >= min_table_rows`; flag `--min-table-rows` (default 10000, 0 desactiva); render texto/JSON con contexto; bump 0.3.0; 28 tests.
+- Aceptación en produccion cumplida: default → EXIT=0 sin falsos positivos; `--min-table-rows 0` → EXIT=2 con contexto (table_rows 156, table_size 1552 kB).
+
 ## Prueba en terreno — Contador Oriental (C:/Users/cerra/codigo/flet)
 
 - BD real: pgvector pg16 en Docker (`auditor_familiar_db`, 127.0.0.1:5432), 25 tablas, 62 índices.

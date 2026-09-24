@@ -1,148 +1,139 @@
-# Herramientas SQL - Auditor de PostgreSQL (`sql-audit`)
+# PostgreSQL Health Auditor (`sql-audit-mcp`)
 
-Auditor centralizado de salud de índices y almacenamiento en PostgreSQL. Detecta:
+A deterministic, zero-hallucination PostgreSQL health and performance auditor. Operates as both a standalone CLI and an on-demand Model Context Protocol (MCP) server.
 
-1. **Índices redundantes**: índices idénticos o que son prefijos de otros índices compuestos.
-2. **Problemas de HOT Updates**: tablas con bajo ratio de actualización HOT y alerta de `fillfactor = 100%`.
-3. **Índices con poco uso**: índices con alto costo en escrituras pero casi nulas lecturas (`idx_scan`).
+Designed to catch silent database performance killers, table-locking bottlenecks, and bloat in $O(1)$ by querying system catalogs (`pg_catalog` and `pg_stat_*`).
 
-## Instalación global
+---
 
-El paquete expone el comando `sql-audit`. Para instalarlo de forma global con `uv`:
+## Key Features
 
-```bash
-uv tool install .
-```
+1. **Deterministic Catalog Inspection**: 100% deterministic rules. Zero tokens wasted on parsing or stochastic triage.
+2. **6 Critical Performance Checks**:
+   - **Invalid Indexes (`indisvalid = false`)**: Indexes aborted during `CREATE INDEX CONCURRENTLY` that incur write overhead without serving reads.
+   - **Unindexed Foreign Keys**: Detects foreign keys lacking a B-tree index on their leading prefix (preventing `SHARE ROW EXCLUSIVE` table-level locks during parent `UPDATE`/`DELETE`).
+   - **Autovacuum & Dead Tuples Lag**: Identifies table bloat and autovacuum starvation (`> 10,000` dead tuples and `> 15%` dead tuple ratio).
+   - **HOT Updates Invalidation**: Finds high-update tables with poor Heap-Only Tuples efficiency (`< 30%`) and warns if `fillfactor = 100`.
+   - **Redundant B-Tree Indexes**: Pinpoints duplicate indexes and prefix-redundant indexes using catalog array slicing.
+   - **Low-Usage / Unprofitable Indexes**: Flags indexes with high write-maintenance overhead but negligible read scans (`idx_scan`).
+3. **Zero-Noise On-Demand Architecture**: Built to be summoned only when needed by LLM agents (Antigravity, Pi, Cursor, Claude Desktop), avoiding prompt context bloat.
+4. **Zero-Trust Credential Security**: Connection strings (`DATABASE_URL`) are resolved from the environment/server side, never leaked over the MCP JSON-RPC protocol.
 
-Después de la instalación podés ejecutarlo desde cualquier proyecto:
+---
 
-```bash
-cd /ruta/de/cualquier/proyecto
-sql-audit
-```
+## Quickstart
 
-Si querés desinstalarlo:
+### Prerequisites
+- Python >= 3.10
+- [`uv`](https://docs.astral.sh/uv/) (recommended for zero-setup execution)
 
-```bash
-uv tool uninstall herraminetas-sql
-```
+### 1. Standalone CLI Execution (via `uv`)
 
-## Uso
-
-```bash
-sql-audit [opciones]
-```
-
-### Sin instalación (ad-hoc con PEP 723)
-
-El script `audit_pg.py` incluye metadatos PEP 723, así que también podés ejecutarlo
-directamente con `uv run` sin instalar nada:
+Run ad-hoc without installing virtual environments (uses PEP 723 metadata):
 
 ```bash
-uv run audit_pg.py
+# Using explicit connection string
+uv run mcp_pg_auditor.py --cli --dsn "postgresql://user:password@localhost:5432/dbname"
+
+# Using DATABASE_URL from .env
+uv run mcp_pg_auditor.py --cli
+
+# Export formatted JSON report
+uv run mcp_pg_auditor.py --cli --json
 ```
 
-### Resolución de configuración
+#### CLI Options:
+| Flag | Description | Default |
+|---|---|---|
+| `--dsn` | Direct PostgreSQL connection string | `$DATABASE_URL` |
+| `--alias` | Connection alias to resolve `DB_<ALIAS>_URL` | `default` |
+| `--schemas` | Comma-separated schemas to audit | `public` |
+| `--min-table-rows` | Minimum live rows to evaluate (eliminates noise on small tables) | `1000` |
+| `--min-size-bytes` | Minimum index size in bytes for redundancy checks | `10000000` (10 MB) |
+| `--json` | Output full structured report as JSON | Disabled |
 
-`sql-audit` resuelve la conexión a la base de datos en este orden de prioridad:
+---
 
-1. `--url <cadena>` (flag explícito).
-2. `--env-file <ruta>` (archivo `.env` explícito con `DATABASE_URL`).
-3. Archivo `.env` descubierto **caminando hacia arriba** desde el directorio actual.
-4. Variables de entorno estándar de libpq: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`.
-5. Variables estilo docker-compose `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT` (compatibilidad: muchos `.env` de proyectos reales las usan).
+## Model Context Protocol (MCP) Server
 
-Si no se encuentra ninguna configuración, el comando termina con código de salida `1`
-y un mensaje en stderr.
+Exposes the tool `pg_health_audit` for AI coding agents.
 
-### Tabla de flags
+### Tool Definition
+- **Tool Name**: `pg_health_audit`
+- **Parameters**:
+  - `schemas` (list of strings, default `["public"]`)
+  - `enabled_checks` (optional list of check names)
+  - `min_table_rows` (integer, default `1000`)
+  - `min_size_bytes` (integer, default `10000000`)
+  - `db_alias` (string, default `"default"`)
 
-| Flag | Descripción | Default |
-|------|-------------|---------|
-| `--url` | Cadena de conexión PostgreSQL. | — |
-| `--env-file` | Ruta a un archivo `.env` con `DATABASE_URL`. | — |
-| `--checks` | Subconjunto de checks separado por comas: `redundant`, `hot`, `low-usage`. | todos |
-| `--schema` | Esquema (namespace) para filtrar. Repetible o separado por comas. | todos |
-| `--min-size` | Ignora índices menores a este tamaño en bytes (checks `redundant` y `low-usage`). | `0` |
-| `--json` | Emite un reporte JSON a stdout. | — |
-| `--quiet` | Imprime solo los conteos del resumen (modo texto). | — |
-| `--timeout` | Timeout de conexión en segundos. | `10` |
-| `--min-hot-ratio` | Ratio HOT mínimo aceptable (porcentaje). | `30.0` |
-| `--min-updates` | Actualizaciones mínimas para considerar una tabla en el análisis HOT. | `50` |
-| `--max-rw-ratio` | Ratio lectura/escritura máximo para marcar un índice como de poco uso. | `0.05` |
-| `--min-table-rows` | Solo reporta issues de `hot` y `low-usage` para tablas con al menos N filas vivas; `0` desactiva el umbral. | `10000` |
+### Client Configuration
 
-### Códigos de salida
-
-| Código | Significado |
-|--------|-------------|
-| `0` | La auditoría corrió y no encontró problemas. |
-| `1` | Error (configuración no encontrada, fallo de conexión o error no manejado). |
-| `2` | La auditoría corrió y encontró al menos un problema. |
-
-### Salida JSON
-
-Con `--json` el reporte se emite como un objeto JSON estable en stdout. La conexión
-nunca se muestra completa: el campo `database` contiene solo el host (sin usuario ni
-contraseña).
-
-```bash
-sql-audit --json
-```
-
+#### Claude Desktop / Cursor (`claude_desktop_config.json`):
 ```json
 {
-  "database": "db.example.com",
-  "checks": ["redundant", "hot", "low-usage"],
-  "summary": {
-    "redundant_indexes": 1,
-    "hot_issues": 0,
-    "low_usage_indexes": 2
-  },
-  "issues": {
-    "redundant": [
-      {
-        "table_name": "users",
-        "redundant_index": "idx_users_email",
-        "redundant_size": "16 kB",
-        "covering_index": "idx_users_email_id",
-        "redundant_def": "CREATE INDEX ...",
-        "covering_def": "CREATE INDEX ..."
+  "mcpServers": {
+    "postgres-auditor": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/Herraminetas_Sql",
+        "mcp_pg_auditor.py"
+      ],
+      "env": {
+        "DATABASE_URL": "postgresql://user:password@localhost:5432/dbname"
       }
-    ],
-    "hot": [],
-    "low-usage": [
-      {
-        "table_name": "events",
-        "index_name": "idx_events_created_at",
-        "size": "32 kB",
-        "index_scans": 3,
-        "table_writes": 5000,
-        "read_write_ratio": 0.0006,
-        "table_rows": 50000,
-        "table_size": "12 MB"
-      }
-    ]
+    }
   }
 }
 ```
 
-Los issues `hot` y `low-usage` incluyen además el contexto de tabla `table_rows` (filas
-vivas estimadas) y `table_size` (tamaño total de la tabla), para distinguir tablas micro
-(ruido) de hallazgos reales.
-
-## Desarrollo
-
-Para sincronizar el entorno de desarrollo (incluye pytest, ruff y mypy):
-
-```bash
-uv sync
+#### Pi Agent (`~/.pi/agent/mcp.json`):
+```json
+{
+  "mcpServers": {
+    "postgres-auditor": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "C:/Users/cerra/codigo/Herraminetas_Sql",
+        "mcp_pg_auditor.py"
+      ],
+      "cwd": "C:/Users/cerra/codigo/Herraminetas_Sql"
+    }
+  }
+}
 ```
 
-Para correr los tests y los linters:
+---
 
-```bash
-uv run --group dev pytest tests -q
-uv run --group dev ruff check audit_pg.py tests
-uv run --group dev mypy audit_pg.py
+## Example Output
+
+```text
+=======================================================
+ PostgreSQL Health Audit Report (default)
+ Execution time: 868.64 ms | Schemas: public
+ Critical issues detected: YES
+=======================================================
+
+[1] Invalid Indexes (indisvalid = false): 0
+[2] Unindexed Foreign Keys: 2
+    - FK: entrega_eventos_usuario_id_fkey on entrega_eventos -> usuarios
+      Def: FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
+    - FK: pagos_registrado_por_fkey on pagos -> usuarios
+      Def: FOREIGN KEY (registrado_por) REFERENCES usuarios(id)
+[3] Autovacuum & Dead Tuples Lag: 0
+[4] Broken HOT Updates / Fillfactor Issues: 0
+[5] Redundant / Duplicate Indexes: 0
+[6] Low Usage / Unprofitable Indexes: 0
+
+Audit completed.
 ```
+
+---
+
+## License
+
+MIT License.
