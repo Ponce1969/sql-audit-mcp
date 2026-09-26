@@ -1,0 +1,81 @@
+{
+  "database": "prod_db.internal",
+  "checks": [
+    "redundant",
+    "hot",
+    "low-usage",
+    "invalid",
+    "unindexed-fks",
+    "dead-tuples"
+  ],
+  "has_critical_issues": true,
+  "summary": {
+    "invalid_indexes": 1,
+    "unindexed_fks": 1,
+    "autovacuum_dead_tuples": 1,
+    "redundant_indexes": 1,
+    "hot_issues": 1,
+    "low_usage_indexes": 1
+  },
+  "issues": {
+    "redundant": [
+      {
+        "table_name": "users",
+        "redundant_index": "idx_users_email",
+        "redundant_size": "16 MB",
+        "covering_index": "idx_users_email_created",
+        "redundant_def": "CREATE INDEX idx_users_email ON users(email)",
+        "covering_def": "CREATE INDEX idx_users_email_created ON users(email, created_at)"
+      }
+    ],
+    "hot": [
+      {
+        "table_name": "users",
+        "total_updates": 1000,
+        "hot_updates": 150,
+        "hot_ratio_pct": 15.0,
+        "fillfactor": 100,
+        "fillfactor_warning": true,
+        "table_rows": 25000,
+        "table_size": "18 MB"
+      }
+    ],
+    "low-usage": [
+      {
+        "table_name": "orders",
+        "index_name": "idx_orders_status",
+        "size": "8 MB",
+        "index_scans": 5,
+        "table_writes": 2000,
+        "read_write_ratio": 0.0025,
+        "table_rows": 50000,
+        "table_size": "45 MB"
+      }
+    ],
+    "invalid": [
+      {
+        "child_table": "orders",
+        "invalid_index": "idx_orders_broken",
+        "index_size": "24 MB"
+      }
+    ],
+    "unindexed-fks": [
+      {
+        "child_table": "order_items",
+        "fk_name": "fk_order_items_product",
+        "parent_table": "products",
+        "fk_definition": "FOREIGN KEY (product_id) REFERENCES products(id)"
+      }
+    ],
+    "dead-tuples": [
+      {
+        "table_name": "events",
+        "dead_tuples": 15000,
+        "live_tuples": 50000,
+        "dead_tuple_pct": 23.08,
+        "last_autovacuum": "2026-09-20T12:00:00+00:00",
+        "last_vacuum": null
+      }
+    ]
+  }
+}

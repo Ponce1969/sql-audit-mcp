@@ -19,6 +19,19 @@ from urllib.parse import quote_plus, urlsplit
 
 from dotenv import find_dotenv, load_dotenv
 
+from sql_audit.application import AuditReport, convert_legacy_report_to_audit_report
+from sql_audit.infrastructure.queries import (
+    SQL_DEAD_TUPLES_ALL_PSYCOPG,
+    SQL_DEAD_TUPLES_SCHEMAS_PSYCOPG,
+    SQL_HOT_PSYCOPG,
+    SQL_INVALID_INDEXES_ALL_PSYCOPG,
+    SQL_INVALID_INDEXES_SCHEMAS_PSYCOPG,
+    SQL_LOW_USAGE_PSYCOPG,
+    SQL_REDUNDANT_PSYCOPG,
+    SQL_UNINDEXED_FKS_ALL_PSYCOPG,
+    SQL_UNINDEXED_FKS_SCHEMAS_PSYCOPG,
+)
+
 try:
     import psycopg2
     import psycopg2.extras
@@ -112,6 +125,31 @@ class DatabaseHealthReport:
     def has_critical_issues(self) -> bool:
         return bool(self.invalid_indexes or self.unindexed_fks or self.autovacuum_dead_tuples)
 
+    def to_audit_report(
+        self,
+        database: str = "localhost",
+        checks: list[str] | None = None,
+        observed_at: datetime | None = None,
+        server_version: str = "unknown",
+        duration_ms: float = 0.0,
+        schemas: list[str] | None = None,
+        min_size_bytes: int = 0,
+        min_table_rows: int = 10000,
+        audit_id: str | None = None,
+    ) -> AuditReport:
+        return convert_legacy_report_to_audit_report(
+            report=self,
+            database=database,
+            checks=checks or list(ALL_CHECKS),
+            observed_at=observed_at,
+            server_version=server_version,
+            duration_ms=duration_ms,
+            schemas=schemas,
+            min_size_bytes=min_size_bytes,
+            min_table_rows=min_table_rows,
+            audit_id=audit_id,
+        )
+
 
 class DatabaseConnectionError(Exception):
     """Raised when the database connection cannot be established."""
@@ -189,30 +227,7 @@ class PostgresHealthAuditor:
         schemas: list[str] | None,
         min_table_rows: int,
     ) -> list[HotUpdateIssue]:
-        query = """
-        SELECT
-            t.relname AS table_name,
-            t.n_tup_upd AS total_updates,
-            t.n_tup_hot_upd AS hot_updates,
-            ROUND(
-                (t.n_tup_hot_upd::numeric / NULLIF(t.n_tup_upd, 0)) * 100, 2
-            )::float AS hot_ratio_pct,
-            COALESCE(
-                (
-                    SELECT option_value::int
-                    FROM pg_options_to_table(c.reloptions)
-                    WHERE option_name = 'fillfactor'
-                ), 100
-            ) AS fillfactor,
-            t.n_live_tup AS table_rows,
-            pg_size_pretty(pg_total_relation_size(t.relid)) AS table_size
-        FROM pg_stat_user_tables t
-        JOIN pg_class c ON c.oid = t.relid
-        JOIN pg_namespace ns ON ns.oid = c.relnamespace
-        WHERE t.n_tup_upd >= %s
-          AND ROUND((t.n_tup_hot_upd::numeric / NULLIF(t.n_tup_upd, 0)) * 100, 2) < %s
-          AND t.n_live_tup >= %s
-        """
+        query = SQL_HOT_PSYCOPG
         params: list[Any] = [min_updates, min_ratio, min_table_rows]
         if schemas:
             query += "          AND ns.nspname = ANY(%s)\n"
@@ -230,46 +245,7 @@ class PostgresHealthAuditor:
     def _audit_redundant_indexes(
         self, cur: Any, schemas: list[str] | None, min_size_bytes: int
     ) -> list[RedundantIndexIssue]:
-        # Detects exact duplicate indexes and left-prefix redundant indexes using CTE.
-        # Restricted to btree indexes that are currently valid (indisvalid = true).
-        query = """
-        WITH parsed_indexes AS (
-            SELECT
-                i.indexrelid,
-                i.indrelid,
-                i.indisunique,
-                i.indisprimary,
-                i.indpred,
-                string_to_array(i.indkey::text, ' ') AS keys,
-                pg_relation_size(i.indexrelid) AS size_bytes
-            FROM pg_index i
-            JOIN pg_class c ON c.oid = i.indexrelid
-            JOIN pg_am am ON am.oid = c.relam
-            WHERE am.amname = 'btree'
-              AND i.indisvalid
-        )
-        SELECT
-            c.relname AS table_name,
-            idx.relname AS redundant_index,
-            pg_size_pretty(p1.size_bytes) AS redundant_size,
-            lead_idx.relname AS covering_index,
-            pg_get_indexdef(p1.indexrelid) AS redundant_def,
-            pg_get_indexdef(p2.indexrelid) AS covering_def
-        FROM parsed_indexes p1
-        JOIN parsed_indexes p2 ON p1.indrelid = p2.indrelid AND p1.indexrelid != p2.indexrelid
-        JOIN pg_class idx ON idx.oid = p1.indexrelid
-        JOIN pg_class c ON c.oid = p1.indrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_class lead_idx ON lead_idx.oid = p2.indexrelid
-        WHERE n.nspname NOT IN ('pg_catalog', 'pg_toast')
-          AND NOT p1.indisunique
-          AND NOT p1.indisprimary
-          AND p1.indpred IS NULL
-          AND '0' != ALL(p1.keys)
-          AND '0' != ALL(p2.keys)
-          AND p2.keys[1:cardinality(p1.keys)] = p1.keys
-          AND p1.size_bytes >= %s
-        """
+        query = SQL_REDUNDANT_PSYCOPG
         params: list[Any] = [min_size_bytes]
         if schemas:
             query += "          AND n.nspname = ANY(%s)\n"
@@ -291,30 +267,7 @@ class PostgresHealthAuditor:
         min_size_bytes: int,
         min_table_rows: int,
     ) -> list[LowUsageIndexIssue]:
-        query = """
-        SELECT
-            i.relname AS table_name,
-            i.indexrelname AS index_name,
-            pg_size_pretty(pg_relation_size(i.indexrelid)) AS size,
-            i.idx_scan AS index_scans,
-            (t.n_tup_ins + t.n_tup_upd + t.n_tup_del) AS table_writes,
-            ROUND(
-                i.idx_scan::numeric / NULLIF(t.n_tup_ins + t.n_tup_upd + t.n_tup_del, 0), 4
-            ) AS read_write_ratio,
-            t.n_live_tup AS table_rows,
-            pg_size_pretty(pg_total_relation_size(t.relid)) AS table_size
-        FROM pg_stat_user_indexes i
-        JOIN pg_stat_user_tables t ON i.relid = t.relid
-        JOIN pg_index idx ON idx.indexrelid = i.indexrelid
-        JOIN pg_class c ON c.oid = i.relid
-        JOIN pg_namespace ns ON ns.oid = c.relnamespace
-        WHERE (t.n_tup_ins + t.n_tup_upd + t.n_tup_del) > 1000
-          AND NOT idx.indisprimary
-          AND NOT idx.indisunique
-          AND (i.idx_scan::numeric / NULLIF(t.n_tup_ins + t.n_tup_upd + t.n_tup_del, 0)) < %s
-          AND pg_relation_size(i.indexrelid) >= %s
-          AND t.n_live_tup >= %s
-        """
+        query = SQL_LOW_USAGE_PSYCOPG
         params: list[Any] = [max_ratio, min_size_bytes, min_table_rows]
         if schemas:
             query += "          AND ns.nspname = ANY(%s)\n"
@@ -333,35 +286,9 @@ class PostgresHealthAuditor:
     ) -> list[InvalidIndexIssue]:
         """Returns indexes with indisvalid = FALSE — these need immediate attention."""
         if schemas:
-            query = """
-            SELECT
-                c.relname AS child_table,
-                idx.relname AS invalid_index,
-                pg_size_pretty(pg_relation_size(i.indexrelid)) AS index_size
-            FROM pg_index i
-            JOIN pg_class idx ON idx.oid = i.indexrelid
-            JOIN pg_class c ON c.oid = i.indrelid
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE i.indisvalid = FALSE
-              AND n.nspname = ANY(%s)
-            ORDER BY pg_relation_size(i.indexrelid) DESC;
-            """
-            cur.execute(query, [schemas])
+            cur.execute(SQL_INVALID_INDEXES_SCHEMAS_PSYCOPG, [schemas])
         else:
-            query = """
-            SELECT
-                c.relname AS child_table,
-                idx.relname AS invalid_index,
-                pg_size_pretty(pg_relation_size(i.indexrelid)) AS index_size
-            FROM pg_index i
-            JOIN pg_class idx ON idx.oid = i.indexrelid
-            JOIN pg_class c ON c.oid = i.indrelid
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE i.indisvalid = FALSE
-              AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
-            ORDER BY pg_relation_size(i.indexrelid) DESC;
-            """
-            cur.execute(query)
+            cur.execute(SQL_INVALID_INDEXES_ALL_PSYCOPG)
         rows = cur.fetchall()
         return [InvalidIndexIssue(**dict(r)) for r in rows]
 
@@ -370,49 +297,9 @@ class PostgresHealthAuditor:
     ) -> list[UnindexedFKIssue]:
         """Returns foreign keys that lack a supporting index on the referencing column(s)."""
         if schemas:
-            query = """
-            SELECT
-                c.conrelid::regclass::text AS child_table,
-                c.conname AS fk_name,
-                c.confrelid::regclass::text AS parent_table,
-                pg_get_constraintdef(c.oid) AS fk_definition
-            FROM pg_constraint c
-            JOIN pg_namespace n ON n.oid = c.connamespace
-            WHERE c.contype = 'f'
-              AND n.nspname = ANY(%s)
-              AND NOT EXISTS (
-                SELECT 1
-                FROM pg_index i
-                WHERE i.indrelid = c.conrelid
-                  AND (string_to_array(i.indkey::text, ' '))[1:cardinality(c.conkey)] =
-                      string_to_array(array_to_string(c.conkey, ' '), ' ')
-                  AND i.indisvalid
-              )
-            ORDER BY c.conrelid::regclass::text, c.conname;
-            """
-            cur.execute(query, [schemas])
+            cur.execute(SQL_UNINDEXED_FKS_SCHEMAS_PSYCOPG, [schemas])
         else:
-            query = """
-            SELECT
-                c.conrelid::regclass::text AS child_table,
-                c.conname AS fk_name,
-                c.confrelid::regclass::text AS parent_table,
-                pg_get_constraintdef(c.oid) AS fk_definition
-            FROM pg_constraint c
-            JOIN pg_namespace n ON n.oid = c.connamespace
-            WHERE c.contype = 'f'
-              AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
-              AND NOT EXISTS (
-                SELECT 1
-                FROM pg_index i
-                WHERE i.indrelid = c.conrelid
-                  AND (string_to_array(i.indkey::text, ' '))[1:cardinality(c.conkey)] =
-                      string_to_array(array_to_string(c.conkey, ' '), ' ')
-                  AND i.indisvalid
-              )
-            ORDER BY c.conrelid::regclass::text, c.conname;
-            """
-            cur.execute(query)
+            cur.execute(SQL_UNINDEXED_FKS_ALL_PSYCOPG)
         rows = cur.fetchall()
         return [UnindexedFKIssue(**dict(r)) for r in rows]
 
@@ -421,40 +308,9 @@ class PostgresHealthAuditor:
     ) -> list[DeadTuplesIssue]:
         """Returns tables with high dead-tuple ratios indicating autovacuum lag."""
         if schemas:
-            query = """
-            SELECT
-                st.relname AS table_name,
-                st.n_dead_tup AS dead_tuples,
-                st.n_live_tup AS live_tuples,
-                ROUND(
-                    (st.n_dead_tup::numeric / NULLIF(st.n_live_tup + st.n_dead_tup, 0)) * 100, 2
-                )::float AS dead_tuple_pct,
-                st.last_autovacuum,
-                st.last_vacuum
-            FROM pg_stat_user_tables st
-            WHERE st.schemaname = ANY(%s)
-              AND st.n_dead_tup > 10000
-              AND (st.n_dead_tup::numeric / NULLIF(st.n_live_tup + st.n_dead_tup, 0)) > 0.15
-            ORDER BY st.n_dead_tup DESC;
-            """
-            cur.execute(query, [schemas])
+            cur.execute(SQL_DEAD_TUPLES_SCHEMAS_PSYCOPG, [schemas])
         else:
-            query = """
-            SELECT
-                st.relname AS table_name,
-                st.n_dead_tup AS dead_tuples,
-                st.n_live_tup AS live_tuples,
-                ROUND(
-                    (st.n_dead_tup::numeric / NULLIF(st.n_live_tup + st.n_dead_tup, 0)) * 100, 2
-                )::float AS dead_tuple_pct,
-                st.last_autovacuum,
-                st.last_vacuum
-            FROM pg_stat_user_tables st
-            WHERE st.n_dead_tup > 10000
-              AND (st.n_dead_tup::numeric / NULLIF(st.n_live_tup + st.n_dead_tup, 0)) > 0.15
-            ORDER BY st.n_dead_tup DESC;
-            """
-            cur.execute(query)
+            cur.execute(SQL_DEAD_TUPLES_ALL_PSYCOPG)
         rows = cur.fetchall()
         return [DeadTuplesIssue(**dict(r)) for r in rows]
 
@@ -776,6 +632,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print only the summary counts (text mode)",
     )
     parser.add_argument(
+        "--canonical-json",
+        action="store_true",
+        help="Emit canonical domain AuditReport JSON with stable finding and evidence IDs",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=DEFAULT_CONNECT_TIMEOUT,
@@ -856,7 +717,16 @@ def main(
         print(f"Failed to audit database: {exc}", file=sys.stderr)
         return 1
 
-    if args.json:
+    if args.canonical_json:
+        audit_report = report.to_audit_report(
+            database=redact_db_url(db_url),
+            checks=selected_checks,
+            schemas=schemas,
+            min_size_bytes=args.min_size,
+            min_table_rows=args.min_table_rows,
+        )
+        print(audit_report.model_dump_json(indent=2))
+    elif args.json:
         print(
             json.dumps(
                 render_json(report, database=redact_db_url(db_url), checks=selected_checks)

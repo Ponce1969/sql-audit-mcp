@@ -19,6 +19,16 @@ from dotenv import find_dotenv, load_dotenv
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
+from sql_audit.application import AuditReport, convert_legacy_report_to_audit_report
+from sql_audit.infrastructure.queries import (
+    SQL_DEAD_TUPLES_ASYNCPG,
+    SQL_HOT_ASYNCPG,
+    SQL_INVALID_INDEXES_ASYNCPG,
+    SQL_LOW_USAGE_ASYNCPG,
+    SQL_REDUNDANT_ASYNCPG,
+    SQL_UNINDEXED_FKS_ASYNCPG,
+)
+
 # Load environment variables from .env if present
 load_dotenv(find_dotenv(usecwd=True))
 
@@ -103,6 +113,28 @@ class PostgresHealthReport(BaseModel):
     redundant_indexes: list[RedundantIndexIssue] = Field(default_factory=list)
     low_usage_indexes: list[LowUsageIndexIssue] = Field(default_factory=list)
 
+    def to_audit_report(
+        self,
+        checks: list[str] | None = None,
+        observed_at: datetime | None = None,
+        server_version: str = "unknown",
+        min_size_bytes: int = 10_000_000,
+        min_table_rows: int = 1000,
+        audit_id: str | None = None,
+    ) -> AuditReport:
+        return convert_legacy_report_to_audit_report(
+            report=self,
+            database=self.database_alias,
+            checks=checks or [c.value for c in CheckName],
+            observed_at=observed_at,
+            server_version=server_version,
+            duration_ms=self.execution_time_ms,
+            schemas=self.schemas_audited,
+            min_size_bytes=min_size_bytes,
+            min_table_rows=min_table_rows,
+            audit_id=audit_id,
+        )
+
 
 # --- Asynchronous PostgreSQL Health Auditor ---
 
@@ -169,68 +201,19 @@ class AsyncPostgresHealthAuditor:
     async def _audit_invalid_indexes(
         self, conn: asyncpg.Connection, schemas: list[str]
     ) -> list[InvalidIndexIssue]:
-        query = """
-        SELECT
-            c.relname AS child_table,
-            idx.relname AS invalid_index,
-            pg_size_pretty(pg_relation_size(i.indexrelid)) AS index_size
-        FROM pg_index i
-        JOIN pg_class idx ON idx.oid = i.indexrelid
-        JOIN pg_class c ON c.oid = i.indrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE i.indisvalid = FALSE
-          AND n.nspname = ANY($1)
-        ORDER BY pg_relation_size(i.indexrelid) DESC;
-        """
-        rows = await conn.fetch(query, schemas)
+        rows = await conn.fetch(SQL_INVALID_INDEXES_ASYNCPG, schemas)
         return [InvalidIndexIssue(**dict(r)) for r in rows]
 
     async def _audit_unindexed_fks(
         self, conn: asyncpg.Connection, schemas: list[str]
     ) -> list[UnindexedFKIssue]:
-        query = """
-        SELECT
-            c.conrelid::regclass::text AS child_table,
-            c.conname AS fk_name,
-            c.confrelid::regclass::text AS parent_table,
-            pg_get_constraintdef(c.oid) AS fk_definition
-        FROM pg_constraint c
-        JOIN pg_namespace n ON n.oid = c.connamespace
-        WHERE c.contype = 'f'
-          AND n.nspname = ANY($1)
-          AND NOT EXISTS (
-            SELECT 1
-            FROM pg_index i
-            WHERE i.indrelid = c.conrelid
-              AND (string_to_array(i.indkey::text, ' '))[1:cardinality(c.conkey)] =
-                  string_to_array(array_to_string(c.conkey, ' '), ' ')
-              AND i.indisvalid
-          )
-        ORDER BY c.conrelid::regclass::text, c.conname;
-        """
-        rows = await conn.fetch(query, schemas)
+        rows = await conn.fetch(SQL_UNINDEXED_FKS_ASYNCPG, schemas)
         return [UnindexedFKIssue(**dict(r)) for r in rows]
 
     async def _audit_autovacuum_dead_tuples(
         self, conn: asyncpg.Connection, schemas: list[str]
     ) -> list[DeadTuplesIssue]:
-        query = """
-        SELECT
-            st.relname AS table_name,
-            st.n_dead_tup AS dead_tuples,
-            st.n_live_tup AS live_tuples,
-            ROUND(
-                (st.n_dead_tup::numeric / NULLIF(st.n_live_tup + st.n_dead_tup, 0)) * 100, 2
-            )::float AS dead_tuple_pct,
-            st.last_autovacuum,
-            st.last_vacuum
-        FROM pg_stat_user_tables st
-        WHERE st.schemaname = ANY($1)
-          AND st.n_dead_tup > 10000
-          AND (st.n_dead_tup::numeric / NULLIF(st.n_live_tup + st.n_dead_tup, 0)) > 0.15
-        ORDER BY st.n_dead_tup DESC;
-        """
-        rows = await conn.fetch(query, schemas)
+        rows = await conn.fetch(SQL_DEAD_TUPLES_ASYNCPG, schemas)
         return [DeadTuplesIssue(**dict(r)) for r in rows]
 
     async def _audit_hot_and_fillfactor(
@@ -241,33 +224,9 @@ class AsyncPostgresHealthAuditor:
         min_ratio: float = 30.0,
         min_updates: int = 50,
     ) -> list[HotUpdateIssue]:
-        query = """
-        SELECT
-            t.relname AS table_name,
-            t.n_tup_upd AS total_updates,
-            t.n_tup_hot_upd AS hot_updates,
-            ROUND(
-                (t.n_tup_hot_upd::numeric / NULLIF(t.n_tup_upd, 0)) * 100, 2
-            )::float AS hot_ratio_pct,
-            COALESCE(
-                (
-                    SELECT option_value::int
-                    FROM pg_options_to_table(c.reloptions)
-                    WHERE option_name = 'fillfactor'
-                ), 100
-            ) AS fillfactor,
-            t.n_live_tup AS table_rows,
-            pg_size_pretty(pg_total_relation_size(t.relid)) AS table_size
-        FROM pg_stat_user_tables t
-        JOIN pg_class c ON c.oid = t.relid
-        JOIN pg_namespace ns ON ns.oid = c.relnamespace
-        WHERE t.n_tup_upd >= $1
-          AND ROUND((t.n_tup_hot_upd::numeric / NULLIF(t.n_tup_upd, 0)) * 100, 2) < $2
-          AND t.n_live_tup >= $3
-          AND ns.nspname = ANY($4)
-        ORDER BY t.n_tup_upd DESC;
-        """
-        rows = await conn.fetch(query, min_updates, min_ratio, min_table_rows, schemas)
+        rows = await conn.fetch(
+            SQL_HOT_ASYNCPG, min_updates, min_ratio, min_table_rows, schemas
+        )
         issues: list[HotUpdateIssue] = []
         for r in rows:
             data = dict(r)
@@ -281,46 +240,7 @@ class AsyncPostgresHealthAuditor:
         schemas: list[str],
         min_size_bytes: int,
     ) -> list[RedundantIndexIssue]:
-        query = """
-        WITH parsed_indexes AS (
-            SELECT
-                i.indexrelid,
-                i.indrelid,
-                i.indisunique,
-                i.indisprimary,
-                i.indpred,
-                string_to_array(i.indkey::text, ' ') AS keys,
-                pg_relation_size(i.indexrelid) AS size_bytes
-            FROM pg_index i
-            JOIN pg_class c ON c.oid = i.indexrelid
-            JOIN pg_am am ON am.oid = c.relam
-            WHERE am.amname = 'btree'
-              AND i.indisvalid
-        )
-        SELECT
-            c.relname AS table_name,
-            idx.relname AS redundant_index,
-            pg_size_pretty(p1.size_bytes) AS redundant_size,
-            lead_idx.relname AS covering_index,
-            pg_get_indexdef(p1.indexrelid) AS redundant_def,
-            pg_get_indexdef(p2.indexrelid) AS covering_def
-        FROM parsed_indexes p1
-        JOIN parsed_indexes p2 ON p1.indrelid = p2.indrelid AND p1.indexrelid != p2.indexrelid
-        JOIN pg_class idx ON idx.oid = p1.indexrelid
-        JOIN pg_class c ON c.oid = p1.indrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_class lead_idx ON lead_idx.oid = p2.indexrelid
-        WHERE n.nspname = ANY($1)
-          AND NOT p1.indisunique
-          AND NOT p1.indisprimary
-          AND p1.indpred IS NULL
-          AND '0' != ALL(p1.keys)
-          AND '0' != ALL(p2.keys)
-          AND p2.keys[1:cardinality(p1.keys)] = p1.keys
-          AND p1.size_bytes >= $2
-        ORDER BY p1.size_bytes DESC;
-        """
-        rows = await conn.fetch(query, schemas, min_size_bytes)
+        rows = await conn.fetch(SQL_REDUNDANT_ASYNCPG, schemas, min_size_bytes)
         return [RedundantIndexIssue(**dict(r)) for r in rows]
 
     async def _audit_low_usage_indexes(
@@ -331,36 +251,8 @@ class AsyncPostgresHealthAuditor:
         min_table_rows: int,
         max_rw_ratio: float = 0.05,
     ) -> list[LowUsageIndexIssue]:
-        query = """
-        SELECT
-            c.relname AS table_name,
-            i.relname AS index_name,
-            pg_size_pretty(pg_relation_size(i.oid)) AS size,
-            s.idx_scan AS index_scans,
-            (t.n_tup_ins + t.n_tup_upd + t.n_tup_del) AS table_writes,
-            ROUND(
-                (s.idx_scan::numeric / NULLIF(t.n_tup_ins + t.n_tup_upd + t.n_tup_del, 0)),
-                4
-            )::float AS read_write_ratio,
-            t.n_live_tup AS table_rows,
-            pg_size_pretty(pg_total_relation_size(t.relid)) AS table_size
-        FROM pg_stat_user_indexes s
-        JOIN pg_stat_user_tables t ON t.relid = s.relid
-        JOIN pg_class c ON c.oid = s.relid
-        JOIN pg_class i ON i.oid = s.indexrelid
-        JOIN pg_index ix ON ix.indexrelid = s.indexrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = ANY($1)
-          AND NOT ix.indisunique
-          AND NOT ix.indisprimary
-          AND (t.n_tup_ins + t.n_tup_upd + t.n_tup_del) > 1000
-          AND (s.idx_scan::numeric / NULLIF(t.n_tup_ins + t.n_tup_upd + t.n_tup_del, 0)) <= $2
-          AND pg_relation_size(i.oid) >= $3
-          AND t.n_live_tup >= $4
-        ORDER BY pg_relation_size(i.oid) DESC;
-        """
         rows = await conn.fetch(
-            query, schemas, max_rw_ratio, min_size_bytes, min_table_rows
+            SQL_LOW_USAGE_ASYNCPG, schemas, max_rw_ratio, min_size_bytes, min_table_rows
         )
         return [LowUsageIndexIssue(**dict(r)) for r in rows]
 

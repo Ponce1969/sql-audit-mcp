@@ -8,13 +8,13 @@
 
 A deterministic, zero-hallucination PostgreSQL health and performance auditor designed for production workloads. Runs both as an installable standalone CLI and as an on-demand [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for AI coding assistants (Antigravity, Pi, Cursor, Claude Desktop).
 
-Catches silent performance bottlenecks, table-level locking hazards, dead tuple bloat, and broken HOT updates in sub-second $O(1)$ catalog queries without putting load on production databases.
+Catches silent performance bottlenecks, table-level locking hazards, dead tuple accumulation, and broken HOT updates in sub-second $O(1)$ catalog queries designed for low-overhead inspection suitable for production environments.
 
 ---
 
 ## Architectural Philosophy
 
-- **Deterministic Inspection Over Stochastic Triage**: We query system catalogs (`pg_catalog`, `pg_stat_*`) directly. Catalog state is immutable ground truth. No LLM should "guess" whether an index is missing or redundant when PostgreSQL catalogs provide the exact answer in microseconds with zero VRAM overhead.
+- **Deterministic Inspection Over Stochastic Triage**: We query system catalogs (`pg_catalog`, `pg_stat_*`) directly. PostgreSQL system catalogs and statistics views provide authoritative database-state evidence for the checks they expose. No LLM should "guess" whether an index is missing or redundant when PostgreSQL catalogs provide the exact answer in microseconds with zero VRAM overhead.
 - **AI as Remediation, Not Ingestion**: The AI assistant (or human DBA) receives structured, verified diagnostics and focuses on reasoning: generating zero-downtime DDL (`CREATE INDEX CONCURRENTLY`), reviewing application queries, and planning migration sequences.
 - **Zero-Noise On-Demand Design**: MCP tool schemas are heavy. When idle, this server injects zero tokens into your agent's context. It is triggered only upon explicit diagnostic intent (`/sql-audit` or "audit database").
 - **Zero-Trust Credential Security**: Credentials and connection strings are resolved strictly on the host/server side (`DATABASE_URL` or `.env`). Database passwords never travel over JSON-RPC protocols or touch LLM context windows.
@@ -27,7 +27,7 @@ Catches silent performance bottlenecks, table-level locking hazards, dead tuple 
 |---|---|---|---|
 | **1** | **Invalid Indexes** | `pg_index.indisvalid = false` | Aborted `CREATE INDEX CONCURRENTLY` leaves unusable index structures. Every `INSERT`/`UPDATE` pays write penalty, while planner ignores it for reads. |
 | **2** | **Unindexed Foreign Keys** | `pg_constraint` vs `pg_index` left-prefix slice | Missing B-Tree index on referencing column forces sequential scans and acquires heavy `SHARE ROW EXCLUSIVE` table-level locks during parent `UPDATE`/`DELETE`. |
-| **3** | **Autovacuum & Dead Tuples Lag** | `pg_stat_user_tables.n_dead_tup` | Identifies tables with `> 10,000` dead tuples and `> 15%` bloat where autovacuum is blocked or lagging, destroying cache locality and table density. |
+| **3** | **Autovacuum & Dead Tuples Lag** | `pg_stat_user_tables.n_dead_tup` | Identifies tables with `> 10,000` dead tuples and `> 15%` dead tuple pressure where autovacuum is blocked or lagging, destroying cache locality and table density. |
 | **4** | **Broken HOT Updates** | `n_tup_hot_upd / n_tup_upd < 30%` & `fillfactor` | High-update tables failing Heap-Only Tuple optimization. Alerts when default `fillfactor = 100` prevents in-page updates and generates excessive WAL traffic. |
 | **5** | **Redundant B-Tree Indexes** | CTE prefix matching `p2.keys[1:len(p1)] = p1.keys` | Detects duplicate indexes and prefix-redundant indexes strictly for B-Tree (`amname = 'btree'`), saving disk, memory cache, and write I/O. |
 | **6** | **Low-Usage / Unprofitable Indexes** | `idx_scan / (writes) < 0.05` | Indexes with high maintenance write overhead and negligible read lookups on tables with `> 1,000` writes. |
