@@ -26,6 +26,12 @@ from sql_audit.domain.models import (
     JsonValue,
     Severity,
 )
+from sql_audit.domain.plan import (
+    PlanAnalysisReport,
+    PlanRiskLevel,
+    PlanSummary,
+    PlanWarning,
+)
 
 __all__ = [
     "AuditDiff",
@@ -43,6 +49,10 @@ __all__ = [
     "LockContentionReport",
     "LockProcess",
     "LockTree",
+    "PlanAnalysisReport",
+    "PlanRiskLevel",
+    "PlanSummary",
+    "PlanWarning",
     "Severity",
     "TableBloat",
     "compute_evidence_id",

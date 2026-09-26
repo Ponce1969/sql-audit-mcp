@@ -21,6 +21,7 @@ from dotenv import find_dotenv, load_dotenv
 
 from sql_audit.application import (
     AuditReport,
+    analyze_execution_plan,
     build_bloat_report,
     build_lock_contention_report,
     compare_audit_reports,
@@ -28,8 +29,15 @@ from sql_audit.application import (
     render_bloat_report_text,
     render_diff_text,
     render_lock_report_text,
+    render_plan_report_text,
 )
-from sql_audit.domain import BloatReport, LockContentionReport, Severity
+from sql_audit.domain import (
+    BloatReport,
+    LockContentionReport,
+    PlanAnalysisReport,
+    PlanRiskLevel,
+    Severity,
+)
 from sql_audit.infrastructure.queries import (
     SQL_DEAD_TUPLES_ALL_PSYCOPG,
     SQL_DEAD_TUPLES_SCHEMAS_PSYCOPG,
@@ -286,6 +294,50 @@ class PostgresHealthAuditor:
                     database=redact_db_url(self.db_url),
                     min_bloat_bytes=min_bloat_bytes,
                     min_bloat_ratio_pct=min_bloat_ratio_pct,
+                )
+        finally:
+            conn.close()
+
+    def explain_query(
+        self,
+        query: str,
+        analyze: bool = False,
+    ) -> PlanAnalysisReport:
+        """Runs EXPLAIN (or safe transactional EXPLAIN ANALYZE) and audits the execution plan."""
+        if not HAS_PSYCOPG2:
+            raise RuntimeError("psycopg2 is not installed. Run: uv add psycopg2-binary")
+
+        try:
+            conn = psycopg2.connect(self.db_url, connect_timeout=self.connect_timeout)
+        except Exception as exc:  # noqa: BLE001
+            raise DatabaseConnectionError(str(exc)) from exc
+
+        try:
+            with conn.cursor() as cur:
+                if analyze:
+                    # Transactional rollback protects against mutating DML
+                    cur.execute("BEGIN;")
+                    explain_sql = f"EXPLAIN (ANALYZE, BUFFERS, COSTS, VERBOSE, FORMAT JSON) {query}"
+                    try:
+                        cur.execute(explain_sql)
+                        row = cur.fetchone()
+                        if not row:
+                            raise RuntimeError("EXPLAIN did not return plan data")
+                        plan_data = row[0]
+                    finally:
+                        cur.execute("ROLLBACK;")
+                else:
+                    explain_sql = f"EXPLAIN (BUFFERS, COSTS, VERBOSE, FORMAT JSON) {query}"
+                    cur.execute(explain_sql)
+                    row = cur.fetchone()
+                    if not row:
+                        raise RuntimeError("EXPLAIN did not return plan data")
+                    plan_data = row[0]
+
+                return analyze_execution_plan(
+                    raw_plan_data=plan_data,
+                    query=query,
+                    database=redact_db_url(self.db_url),
                 )
         finally:
             conn.close()
@@ -765,6 +817,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=20.0,
         help="Minimum bloat percentage to flag as bloat (default: 20.0)",
     )
+    parser.add_argument(
+        "--explain",
+        default=None,
+        help="Simulate execution plan for a SQL query text and audit for performance bottlenecks",
+    )
+    parser.add_argument(
+        "--explain-file",
+        default=None,
+        help="Path to SQL file containing query to explain and audit",
+    )
+    parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help="Execute query inside a rolled-back transaction to capture runtime stats and buffers",
+    )
     return parser
 
 
@@ -797,6 +864,40 @@ def main(
         return 1
 
     auditor = auditor_factory(db_url=db_url, connect_timeout=args.timeout)
+
+    if args.explain or args.explain_file:
+        query_text = args.explain
+        if args.explain_file:
+            try:
+                with open(args.explain_file, encoding="utf-8") as f:
+                    query_text = f.read()
+            except Exception as exc:  # noqa: BLE001
+                print(f"Error reading SQL file: {exc}", file=sys.stderr)
+                return 1
+
+        if not query_text or not query_text.strip():
+            print("Error: query text is empty", file=sys.stderr)
+            return 1
+
+        try:
+            plan_report = auditor.explain_query(query=query_text, analyze=args.analyze)
+        except DatabaseConnectionError as exc:
+            print(f"Connection failed: {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"Failed to explain query: {exc}", file=sys.stderr)
+            return 1
+
+        if args.canonical_json or args.json:
+            print(plan_report.model_dump_json(indent=2))
+        else:
+            print(render_plan_report_text(plan_report))
+
+        has_high_risk = any(
+            w.risk_level in (PlanRiskLevel.HIGH, PlanRiskLevel.CRITICAL)
+            for w in plan_report.summary.warnings
+        )
+        return 3 if has_high_risk else (2 if plan_report.summary.warnings else 0)
 
     if args.locks:
         try:

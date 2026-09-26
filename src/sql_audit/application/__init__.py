@@ -22,10 +22,15 @@ from sql_audit.application.mapping import (
     map_redundant_index_to_finding,
     map_unindexed_fk_to_finding,
 )
+from sql_audit.application.plan_service import (
+    analyze_execution_plan,
+    render_plan_report_text,
+)
 from sql_audit.domain.models import AuditReport
 
 __all__ = [
     "AuditReport",
+    "analyze_execution_plan",
     "bloat_report_to_findings",
     "build_audit_report",
     "build_bloat_report",
@@ -42,4 +47,5 @@ __all__ = [
     "render_bloat_report_text",
     "render_diff_text",
     "render_lock_report_text",
+    "render_plan_report_text",
 ]

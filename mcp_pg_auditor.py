@@ -21,13 +21,15 @@ from pydantic import BaseModel, Field
 
 from sql_audit.application import (
     AuditReport,
+    analyze_execution_plan,
     build_bloat_report,
     build_lock_contention_report,
     convert_legacy_report_to_audit_report,
     render_bloat_report_text,
     render_lock_report_text,
+    render_plan_report_text,
 )
-from sql_audit.domain import BloatReport, LockContentionReport
+from sql_audit.domain import BloatReport, LockContentionReport, PlanAnalysisReport
 from sql_audit.infrastructure.queries import (
     SQL_DEAD_TUPLES_ASYNCPG,
     SQL_HOT_ASYNCPG,
@@ -244,6 +246,39 @@ class AsyncPostgresHealthAuditor:
         finally:
             await conn.close()
 
+    async def explain_query(
+        self,
+        query: str,
+        analyze: bool = False,
+        db_alias: str = "default",
+    ) -> PlanAnalysisReport:
+        """Runs EXPLAIN (or safe transactional EXPLAIN ANALYZE) and audits the execution plan."""
+        import json
+
+        conn = await asyncpg.connect(self.dsn, timeout=self.connect_timeout)
+        try:
+            if analyze:
+                # Transactional rollback ensures safety against mutating DML
+                tx = conn.transaction()
+                await tx.start()
+                try:
+                    explain_sql = f"EXPLAIN (ANALYZE, BUFFERS, COSTS, VERBOSE, FORMAT JSON) {query}"
+                    raw = await conn.fetchval(explain_sql)
+                finally:
+                    await tx.rollback()
+            else:
+                explain_sql = f"EXPLAIN (BUFFERS, COSTS, VERBOSE, FORMAT JSON) {query}"
+                raw = await conn.fetchval(explain_sql)
+
+            plan_data = json.loads(raw) if isinstance(raw, str) else raw
+            return analyze_execution_plan(
+                raw_plan_data=plan_data,
+                query=query,
+                database=db_alias,
+            )
+        finally:
+            await conn.close()
+
     async def _audit_invalid_indexes(
         self, conn: asyncpg.Connection, schemas: list[str]
     ) -> list[InvalidIndexIssue]:
@@ -415,6 +450,30 @@ async def pg_bloat(
     )
 
 
+@mcp.tool(
+    name="pg_explain",
+    description=(
+        "Simulates or executes a SQL query using PostgreSQL EXPLAIN (or safe transactional "
+        "EXPLAIN ANALYZE with immediate rollback) and audits the plan for performance bottlenecks: "
+        "large sequential scans, work_mem disk spills, cardinality estimation skew, and "
+        "high buffer I/O."
+    ),
+)
+async def pg_explain(
+    query: str,
+    analyze: bool = False,
+    db_alias: str = "default",
+    connect_timeout: int | None = None,
+) -> PlanAnalysisReport:
+    """Simulates or audits a PostgreSQL execution plan."""
+    dsn = resolve_dsn(db_alias)
+    auditor = AsyncPostgresHealthAuditor(
+        dsn=dsn,
+        connect_timeout=connect_timeout if connect_timeout is not None else 10,
+    )
+    return await auditor.explain_query(query=query, analyze=analyze, db_alias=db_alias)
+
+
 async def _run_cli_main() -> None:
     import argparse
 
@@ -459,6 +518,12 @@ async def _run_cli_main() -> None:
     parser.add_argument(
         "--bloat", action="store_true", help="Estimate physical bloat in tables and indexes"
     )
+    parser.add_argument(
+        "--explain", default=None, help="Query string to explain and audit"
+    )
+    parser.add_argument(
+        "--analyze", action="store_true", help="Execute query in rolled-back tx for runtime stats"
+    )
 
     raw_args = [a for a in sys.argv[1:] if a not in ("--cli", "-c")]
     args = parser.parse_args(raw_args)
@@ -489,6 +554,18 @@ async def _run_cli_main() -> None:
             print(bloat_report.model_dump_json(indent=2))
         else:
             print(render_bloat_report_text(bloat_report))
+        return
+
+    if args.explain:
+        plan_report = await auditor.explain_query(
+            query=args.explain,
+            analyze=args.analyze,
+            db_alias=args.alias,
+        )
+        if args.json:
+            print(plan_report.model_dump_json(indent=2))
+        else:
+            print(render_plan_report_text(plan_report))
         return
 
     schemas = [s.strip() for s in args.schemas.split(",") if s.strip()]
