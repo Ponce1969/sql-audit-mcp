@@ -53,7 +53,15 @@ def test_render_json_schema_stability():
     assert data == {
         "database": "dbhost",
         "checks": ["redundant", "hot", "low-usage"],
-        "summary": {"redundant_indexes": 0, "hot_issues": 1, "low_usage_indexes": 1},
+        "has_critical_issues": False,
+        "summary": {
+            "invalid_indexes": 0,
+            "unindexed_fks": 0,
+            "autovacuum_dead_tuples": 0,
+            "redundant_indexes": 0,
+            "hot_issues": 1,
+            "low_usage_indexes": 1,
+        },
         "issues": {
             "redundant": [],
             "hot": [
@@ -87,7 +95,14 @@ def test_render_json_schema_stability():
 def test_render_json_empty_report():
     report = DatabaseHealthReport()
     data = audit_pg.render_json(report, database="dbhost", checks=["redundant", "hot", "low-usage"])
-    assert data["summary"] == {"redundant_indexes": 0, "hot_issues": 0, "low_usage_indexes": 0}
+    assert data["summary"] == {
+        "invalid_indexes": 0,
+        "unindexed_fks": 0,
+        "autovacuum_dead_tuples": 0,
+        "redundant_indexes": 0,
+        "hot_issues": 0,
+        "low_usage_indexes": 0,
+    }
     assert data["issues"] == {"redundant": [], "hot": [], "low-usage": []}
 
 
@@ -106,6 +121,46 @@ def test_has_issues():
     assert audit_pg.has_issues(DatabaseHealthReport()) is False
     issue = HotUpdateIssue("t", 1, 1, 100.0, 100, False, 50000, "12 MB")
     assert audit_pg.has_issues(DatabaseHealthReport(hot_issues=[issue])) is True
+    # Critical-only issue
+    from audit_pg import InvalidIndexIssue
+    inv = InvalidIndexIssue("t", "idx_bad", "10 MB")
+    assert audit_pg.has_issues(DatabaseHealthReport(invalid_indexes=[inv])) is True
+
+
+def test_render_text_with_critical_issues():
+    from audit_pg import DeadTuplesIssue, InvalidIndexIssue, UnindexedFKIssue
+    report = DatabaseHealthReport(
+        invalid_indexes=[InvalidIndexIssue("orders", "idx_orders_bad", "10 MB")],
+        unindexed_fks=[
+            UnindexedFKIssue(
+                "order_items", "fk_order", "orders", "FOREIGN KEY (o_id) REFERENCES orders(id)"
+            )
+        ],
+        autovacuum_dead_tuples=[DeadTuplesIssue("logs", 20000, 100000, 16.67, None, None)],
+    )
+    text = audit_pg.render_text(report)
+    assert "INVALID INDEXES (indisvalid = false): 1" in text
+    assert "* Table: orders" in text
+    assert "Invalid index: idx_orders_bad" in text
+    assert "UNINDEXED FOREIGN KEYS: 1" in text
+    assert "* Table: order_items -> orders" in text
+    assert "AUTOVACUUM & DEAD TUPLES LAG: 1" in text
+    assert "Dead Tuples: 20,000" in text
+
+
+def test_render_quiet_with_all_checks():
+    from audit_pg import InvalidIndexIssue, UnindexedFKIssue
+    report = DatabaseHealthReport(
+        invalid_indexes=[InvalidIndexIssue("orders", "idx_bad", "10 MB")],
+        unindexed_fks=[UnindexedFKIssue("items", "fk_items", "orders", "def")],
+    )
+    quiet = audit_pg.render_quiet(report)
+    assert "invalid_indexes: 1" in quiet
+    assert "unindexed_fks: 1" in quiet
+    assert "autovacuum_dead_tuples: 0" in quiet
+    assert "redundant_indexes: 0" in quiet
+    assert "hot_issues: 0" in quiet
+    assert "low_usage_indexes: 0" in quiet
 
 
 # ---------------------------------------------------------------------------

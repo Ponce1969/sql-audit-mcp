@@ -114,7 +114,14 @@ def test_json_output_is_valid_and_redacted(capsys):
     assert data["checks"] == [
         "redundant", "hot", "low-usage", "invalid", "unindexed-fks", "dead-tuples"
     ]
-    assert data["summary"] == {"redundant_indexes": 1, "hot_issues": 1, "low_usage_indexes": 0}
+    assert data["summary"] == {
+        "redundant_indexes": 1,
+        "hot_issues": 1,
+        "low_usage_indexes": 0,
+        "invalid_indexes": 0,
+        "unindexed_fks": 0,
+        "autovacuum_dead_tuples": 0,
+    }
     assert set(data["issues"]) == {
         "redundant", "hot", "low-usage", "invalid", "unindexed-fks", "dead-tuples"
     }

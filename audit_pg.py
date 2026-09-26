@@ -466,9 +466,56 @@ def render_text(report: DatabaseHealthReport) -> str:
     lines.append("        POSTGRESQL STORAGE & INDEX HEALTH REPORT")
     lines.append("=" * 65)
 
-    # 1. Redundant Indexes
+    # 1. Invalid Indexes (Critical)
     lines.append("")
-    lines.append(f"[1] REDUNDANT / PREFIX INDEXES FOUND: {len(report.redundant_indexes)}")
+    lines.append(f"[1] INVALID INDEXES (indisvalid = false): {len(report.invalid_indexes)}")
+    if not report.invalid_indexes:
+        lines.append("  -> OK: No invalid indexes detected.")
+    else:
+        for inv in report.invalid_indexes:
+            lines.append(f"  * Table: {inv.child_table}")
+            lines.append(f"    - Invalid index: {inv.invalid_index} (Size: {inv.index_size})")
+            lines.append(
+                f"    - Suggestion: DROP INDEX CONCURRENTLY {inv.invalid_index}; "
+                "then rebuild if necessary."
+            )
+            lines.append("")
+
+    # 2. Unindexed Foreign Keys (Critical)
+    lines.append(f"[2] UNINDEXED FOREIGN KEYS: {len(report.unindexed_fks)}")
+    if not report.unindexed_fks:
+        lines.append("  -> OK: No unindexed foreign keys detected.")
+    else:
+        for fk in report.unindexed_fks:
+            lines.append(f"  * Table: {fk.child_table} -> {fk.parent_table}")
+            lines.append(f"    - FK: {fk.fk_name}")
+            lines.append(f"    - Definition: {fk.fk_definition}")
+            lines.append(
+                "    - Suggestion: Consider CREATE INDEX CONCURRENTLY to prevent table locks."
+            )
+            lines.append("")
+
+    # 3. Autovacuum & Dead Tuples Lag (Critical)
+    lines.append(f"[3] AUTOVACUUM & DEAD TUPLES LAG: {len(report.autovacuum_dead_tuples)}")
+    if not report.autovacuum_dead_tuples:
+        lines.append("  -> OK: No tables with autovacuum lag or excessive dead tuples.")
+    else:
+        for dt in report.autovacuum_dead_tuples:
+            lines.append(f"  * Table: {dt.table_name}")
+            lines.append(
+                f"    - Dead Tuples: {dt.dead_tuples:,} ({dt.dead_tuple_pct}%) | "
+                f"Live Tuples: {dt.live_tuples:,}"
+            )
+            last_auto = dt.last_autovacuum.isoformat() if dt.last_autovacuum else "never"
+            last_vac = dt.last_vacuum.isoformat() if dt.last_vacuum else "never"
+            lines.append(f"    - Last Autovacuum: {last_auto} | Last Vacuum: {last_vac}")
+            lines.append(
+                "    - Suggestion: Check long-running transactions and autovacuum settings."
+            )
+            lines.append("")
+
+    # 4. Redundant Indexes
+    lines.append(f"[4] REDUNDANT / PREFIX INDEXES FOUND: {len(report.redundant_indexes)}")
     if not report.redundant_indexes:
         lines.append("  -> OK: No redundant indexes detected.")
     else:
@@ -480,8 +527,8 @@ def render_text(report: DatabaseHealthReport) -> str:
             lines.append(f"    - Suggestion: Consider DROP INDEX {idx.redundant_index};")
             lines.append("")
 
-    # 2. HOT Updates & Fillfactor
-    lines.append(f"[2] LOW HOT UPDATE EFFICIENCY: {len(report.hot_issues)}")
+    # 5. HOT Updates & Fillfactor
+    lines.append(f"[5] LOW HOT UPDATE EFFICIENCY: {len(report.hot_issues)}")
     if not report.hot_issues:
         lines.append("  -> OK: No tables with low HOT update ratio.")
     else:
@@ -507,8 +554,10 @@ def render_text(report: DatabaseHealthReport) -> str:
                 )
                 lines.append("")
 
-    # 3. Low Usage Indexes
-    lines.append(f"[3] UNPROFITABLE / HIGH-WRITE LOW-READ INDEXES: {len(report.low_usage_indexes)}")
+    # 6. Low Usage Indexes
+    lines.append(
+        f"[6] UNPROFITABLE / HIGH-WRITE LOW-READ INDEXES: {len(report.low_usage_indexes)}"
+    )
     if not report.low_usage_indexes:
         lines.append("  -> OK: No unprofitable indexes detected.")
     else:
@@ -535,6 +584,9 @@ def print_report(report: DatabaseHealthReport) -> None:
 
 def render_quiet(report: DatabaseHealthReport) -> str:
     lines = [
+        f"invalid_indexes: {len(report.invalid_indexes)}",
+        f"unindexed_fks: {len(report.unindexed_fks)}",
+        f"autovacuum_dead_tuples: {len(report.autovacuum_dead_tuples)}",
         f"redundant_indexes: {len(report.redundant_indexes)}",
         f"hot_issues: {len(report.hot_issues)}",
         f"low_usage_indexes: {len(report.low_usage_indexes)}",
@@ -545,6 +597,8 @@ def render_quiet(report: DatabaseHealthReport) -> str:
 def _jsonable(value: Any) -> Any:
     if isinstance(value, Decimal):
         return float(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
     return value
 
 
@@ -561,7 +615,11 @@ def render_json(
     return {
         "database": database,
         "checks": list(checks),
+        "has_critical_issues": report.has_critical_issues,
         "summary": {
+            "invalid_indexes": len(report.invalid_indexes),
+            "unindexed_fks": len(report.unindexed_fks),
+            "autovacuum_dead_tuples": len(report.autovacuum_dead_tuples),
             "redundant_indexes": len(report.redundant_indexes),
             "hot_issues": len(report.hot_issues),
             "low_usage_indexes": len(report.low_usage_indexes),
@@ -571,7 +629,14 @@ def render_json(
 
 
 def has_issues(report: DatabaseHealthReport) -> bool:
-    return bool(report.hot_issues or report.redundant_indexes or report.low_usage_indexes)
+    return bool(
+        report.hot_issues
+        or report.redundant_indexes
+        or report.low_usage_indexes
+        or report.invalid_indexes
+        or report.unindexed_fks
+        or report.autovacuum_dead_tuples
+    )
 
 
 def redact_db_url(db_url: str) -> str:
