@@ -69,12 +69,14 @@ class InvalidIndexIssue:
     invalid_index: str
     index_size: str
 
+
 @dataclass(frozen=True)
 class UnindexedFKIssue:
     child_table: str
     fk_name: str
     parent_table: str
     fk_definition: str
+
 
 @dataclass(frozen=True)
 class DeadTuplesIssue:
@@ -113,12 +115,12 @@ All 28 existing tests construct `DatabaseHealthReport()` using keyword args for 
 ALL_CHECKS = ["redundant", "hot", "low-usage", "invalid", "unindexed-fks", "dead-tuples"]
 
 CHECK_FIELDS: dict[str, str] = {
-    "redundant":     "redundant_indexes",
-    "hot":           "hot_issues",
-    "low-usage":     "low_usage_indexes",
-    "invalid":       "invalid_indexes",
+    "redundant": "redundant_indexes",
+    "hot": "hot_issues",
+    "low-usage": "low_usage_indexes",
+    "invalid": "invalid_indexes",
     "unindexed-fks": "unindexed_fks",
-    "dead-tuples":   "autovacuum_dead_tuples",
+    "dead-tuples": "autovacuum_dead_tuples",
 }
 ```
 
@@ -129,9 +131,9 @@ def _audit_invalid_indexes(
     self, cur: Any, schemas: list[str] | None
 ) -> list[InvalidIndexIssue]: ...
 
-def _audit_unindexed_fks(
-    self, cur: Any, schemas: list[str] | None
-) -> list[UnindexedFKIssue]: ...
+
+def _audit_unindexed_fks(self, cur: Any, schemas: list[str] | None) -> list[UnindexedFKIssue]: ...
+
 
 def _audit_autovacuum_dead_tuples(
     self, cur: Any, schemas: list[str] | None
@@ -206,10 +208,11 @@ sql-audit-mcp = "mcp_pg_auditor:run_mcp_cli"
 
 ```python
 # Replace DSN resolution block (lines ~458-461):
-from audit_pg import resolve_db_url          # add import at function top
-dsn = resolve_db_url(cli_url=args.dsn)       # 5-step chain from audit_pg
+from audit_pg import resolve_db_url  # add import at function top
+
+dsn = resolve_db_url(cli_url=args.dsn)  # 5-step chain from audit_pg
 if not dsn:
-    dsn = resolve_dsn(args.alias)            # fallback to alias-based env var
+    dsn = resolve_dsn(args.alias)  # fallback to alias-based env var
 ```
 
 Also add `--timeout` flag to `_run_cli_main` argparse and pass it to `AsyncPostgresHealthAuditor`.
@@ -223,7 +226,7 @@ async def pg_health_audit(
     min_table_rows: int = 1000,
     min_size_bytes: int = 10_000_000,
     db_alias: str = "default",
-    connect_timeout: int | None = None,       # NEW — None = use auditor default (10s)
+    connect_timeout: int | None = None,  # NEW — None = use auditor default (10s)
 ) -> PostgresHealthReport:
     ...
     executor = AsyncPostgresHealthAuditor(
@@ -238,6 +241,7 @@ async def pg_health_audit(
 def run_mcp_cli() -> None:
     """Sync entry point for [project.scripts] — asyncio wrapper for _run_cli_main."""
     import asyncio
+
     asyncio.run(_run_cli_main())
 ```
 
@@ -266,6 +270,7 @@ def make_async_auditor_factory(report: PostgresHealthReport):
     class FakeAsyncAuditor:
         async def run_full_audit(self, **kw) -> PostgresHealthReport:
             return report
+
     return FakeAsyncAuditor()
 ```
 

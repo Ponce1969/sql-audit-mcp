@@ -226,4 +226,3 @@ def test_cli_diff_flow(tmp_path, capsys):
     assert data["previous_audit_id"] == "audit_prev_101"
     assert data["summary"]["new_count"] == 1
     assert data["new_findings"][0]["finding_id"] == "PG-INDEX-INVALID:orders:idx_orders_bad"
-

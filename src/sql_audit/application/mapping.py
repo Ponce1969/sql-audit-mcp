@@ -77,9 +77,7 @@ def map_unindexed_fk_to_finding(
         evidence_id=evidence_id,
     )
     return Finding(
-        finding_id=compute_stable_finding_id(
-            "PG-FK-UNINDEXED", "table", child_table, fk_name
-        ),
+        finding_id=compute_stable_finding_id("PG-FK-UNINDEXED", "table", child_table, fk_name),
         check="unindexed_fks",
         severity=Severity.HIGH,
         object_type="constraint",
@@ -101,9 +99,7 @@ def map_dead_tuples_to_finding(
     last_autovacuum = row.get("last_autovacuum")
     last_vacuum = row.get("last_vacuum")
 
-    last_auto_iso = (
-        last_autovacuum.isoformat() if isinstance(last_autovacuum, datetime) else None
-    )
+    last_auto_iso = last_autovacuum.isoformat() if isinstance(last_autovacuum, datetime) else None
     last_vac_iso = last_vacuum.isoformat() if isinstance(last_vacuum, datetime) else None
 
     values: dict[str, JsonValue] = {
@@ -124,9 +120,7 @@ def map_dead_tuples_to_finding(
         evidence_id=evidence_id,
     )
     return Finding(
-        finding_id=compute_stable_finding_id(
-            "PG-VACUUM-DEAD-TUPLES", "table", table_name
-        ),
+        finding_id=compute_stable_finding_id("PG-VACUUM-DEAD-TUPLES", "table", table_name),
         check="autovacuum_dead_tuples",
         severity=Severity.HIGH,
         object_type="table",
@@ -262,9 +256,7 @@ def map_low_usage_index_to_finding(
         evidence_id=evidence_id,
     )
     return Finding(
-        finding_id=compute_stable_finding_id(
-            "PG-INDEX-LOW-USAGE", "table", table_name, index_name
-        ),
+        finding_id=compute_stable_finding_id("PG-INDEX-LOW-USAGE", "table", table_name, index_name),
         check="low_usage_indexes",
         severity=Severity.LOW,
         object_type="index",
@@ -383,4 +375,3 @@ def convert_legacy_report_to_audit_report(
         server_version=server_version,
         audit_id=audit_id,
     )
-

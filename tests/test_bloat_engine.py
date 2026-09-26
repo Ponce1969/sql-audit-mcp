@@ -99,8 +99,8 @@ def test_bloat_engine_detects_table_and_index_bloat():
     # Validate text rendering
     rendered = render_bloat_report_text(report)
     assert "POSTGRESQL PHYSICAL BLOAT ESTIMATION: prod_db" in rendered
-    assert "• public.orders: 57.2 MB bloat (60.0%)" in rendered
-    assert "• public.idx_orders_customer (on orders): 28.6 MB bloat" in rendered
+    assert "- public.orders: 57.2 MB bloat (60.0%)" in rendered
+    assert "- public.idx_orders_customer (on orders): 28.6 MB bloat" in rendered
 
 
 def test_cli_bloat_clean_flow(capsys):

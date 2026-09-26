@@ -286,9 +286,7 @@ async def test_run_full_audit_partial_checks_skips_omitted():
 
 def test_mcp_report_has_critical_issues_true():
     """Report with non-empty invalid_indexes → has_critical_issues is True."""
-    issue = InvalidIndexIssue(
-        child_table="tbl", invalid_index="idx_bad", index_size="8 kB"
-    )
+    issue = InvalidIndexIssue(child_table="tbl", invalid_index="idx_bad", index_size="8 kB")
     report = PostgresHealthReport(
         database_alias="test",
         schemas_audited=["public"],

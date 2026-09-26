@@ -66,12 +66,12 @@ except ImportError:  # pragma: no cover
 
 ALL_CHECKS = ["redundant", "hot", "low-usage", "invalid", "unindexed-fks", "dead-tuples"]
 CHECK_FIELDS: dict[str, str] = {
-    "redundant":     "redundant_indexes",
-    "hot":           "hot_issues",
-    "low-usage":     "low_usage_indexes",
-    "invalid":       "invalid_indexes",
+    "redundant": "redundant_indexes",
+    "hot": "hot_issues",
+    "low-usage": "low_usage_indexes",
+    "invalid": "invalid_indexes",
     "unindexed-fks": "unindexed_fks",
-    "dead-tuples":   "autovacuum_dead_tuples",
+    "dead-tuples": "autovacuum_dead_tuples",
 }
 DEFAULT_CONNECT_TIMEOUT = 10
 
@@ -415,9 +415,7 @@ class PostgresHealthAuditor:
         rows = cur.fetchall()
         return [InvalidIndexIssue(**dict(r)) for r in rows]
 
-    def _audit_unindexed_fks(
-        self, cur: Any, schemas: list[str] | None
-    ) -> list[UnindexedFKIssue]:
+    def _audit_unindexed_fks(self, cur: Any, schemas: list[str] | None) -> list[UnindexedFKIssue]:
         """Returns foreign keys that lack a supporting index on the referencing column(s)."""
         if schemas:
             cur.execute(SQL_UNINDEXED_FKS_SCHEMAS_PSYCOPG, [schemas])
@@ -522,9 +520,7 @@ def render_text(report: DatabaseHealthReport) -> str:
                 f"    - HOT Ratio: {issue.hot_ratio_pct}% "
                 f"({issue.hot_updates} HOT / {issue.total_updates} total updates)"
             )
-            lines.append(
-                f"    - Rows: {issue.table_rows} | Table size: {issue.table_size}"
-            )
+            lines.append(f"    - Rows: {issue.table_rows} | Table size: {issue.table_size}")
             lines.append(f"    - Fillfactor: {issue.fillfactor}%{warning}")
             if issue.fillfactor_warning:
                 lines.append(
@@ -534,9 +530,7 @@ def render_text(report: DatabaseHealthReport) -> str:
                 lines.append("")
 
     # 6. Low Usage Indexes
-    lines.append(
-        f"[6] UNPROFITABLE / HIGH-WRITE LOW-READ INDEXES: {len(report.low_usage_indexes)}"
-    )
+    lines.append(f"[6] UNPROFITABLE / HIGH-WRITE LOW-READ INDEXES: {len(report.low_usage_indexes)}")
     if not report.low_usage_indexes:
         lines.append("  -> OK: No unprofitable indexes detected.")
     else:
@@ -581,9 +575,7 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def render_json(
-    report: DatabaseHealthReport, database: str, checks: list[str]
-) -> dict[str, Any]:
+def render_json(report: DatabaseHealthReport, database: str, checks: list[str]) -> dict[str, Any]:
     issues: dict[str, list[dict[str, Any]]] = {}
     for check in checks:
         field_name = CHECK_FIELDS[check]
@@ -729,8 +721,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--checks",
-        help="Comma-separated subset of checks to run: redundant, hot, low-usage "
-        "(default: all)",
+        help="Comma-separated subset of checks to run: redundant, hot, low-usage (default: all)",
     )
     parser.add_argument(
         "--schema",
@@ -741,8 +732,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-size",
         type=int,
         default=0,
-        help="Ignore indexes below this size in bytes (redundant and low-usage checks, "
-        "default: 0)",
+        help="Ignore indexes below this size in bytes (redundant and low-usage checks, default: 0)",
     )
     parser.add_argument(
         "--json",
@@ -999,9 +989,7 @@ def main(
         print(audit_report.model_dump_json(indent=2))
     elif args.json:
         print(
-            json.dumps(
-                render_json(report, database=redact_db_url(db_url), checks=selected_checks)
-            )
+            json.dumps(render_json(report, database=redact_db_url(db_url), checks=selected_checks))
         )
     elif args.quiet:
         print(render_quiet(report))

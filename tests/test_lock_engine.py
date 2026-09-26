@@ -226,4 +226,3 @@ async def test_mcp_pg_locks_tool(monkeypatch):
     assert result.total_blocked_processes == 0
     assert result.distinct_root_blockers == 0
     assert len(result.trees) == 0
-

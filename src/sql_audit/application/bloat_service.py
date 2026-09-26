@@ -85,9 +85,7 @@ def build_bloat_report(
     )
 
 
-def bloat_report_to_findings(
-    report: BloatReport, server_version: str = "16.0"
-) -> list[Finding]:
+def bloat_report_to_findings(report: BloatReport, server_version: str = "16.0") -> list[Finding]:
     """Converts bloated tables and indexes into canonical Finding entities."""
     findings: list[Finding] = []
 
@@ -214,7 +212,7 @@ def render_bloat_report_text(report: BloatReport) -> str:
         lines.append(f"\n--- BLOATED TABLES ({len(bloated_tables)}) ---")
         for t in bloated_tables:
             lines.append(
-                f"• {t.schema_name}.{t.table_name}: {_format_bytes(t.bloat_bytes)} bloat "
+                f"- {t.schema_name}.{t.table_name}: {_format_bytes(t.bloat_bytes)} bloat "
                 f"({t.bloat_ratio_pct:.1f}%) | Real: {_format_bytes(t.table_size_bytes)} | "
                 f"Expected: {_format_bytes(t.expected_size_bytes)}"
             )
@@ -223,7 +221,7 @@ def render_bloat_report_text(report: BloatReport) -> str:
         lines.append(f"\n--- BLOATED B-TREE INDEXES ({len(bloated_indexes)}) ---")
         for idx in bloated_indexes:
             lines.append(
-                f"• {idx.schema_name}.{idx.index_name} (on {idx.table_name}): "
+                f"- {idx.schema_name}.{idx.index_name} (on {idx.table_name}): "
                 f"{_format_bytes(idx.bloat_bytes)} bloat ({idx.bloat_ratio_pct:.1f}%) | "
                 f"Real: {_format_bytes(idx.index_size_bytes)} | "
                 f"Expected: {_format_bytes(idx.expected_size_bytes)}"

@@ -40,9 +40,7 @@ class Evidence(BaseModel):
     server_version: str
     query_name: str
     values: dict[str, JsonValue]
-    evidence_id: str = Field(
-        description="Deterministic SHA-256 digest of observed runtime values"
-    )
+    evidence_id: str = Field(description="Deterministic SHA-256 digest of observed runtime values")
 
 
 class Finding(BaseModel):

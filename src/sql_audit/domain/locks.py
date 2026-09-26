@@ -43,9 +43,7 @@ class LockTree(BaseModel):
     total_blocked: int
     blocked_pids: list[int]
     max_blocked_duration_sec: float
-    chain_representation: str = Field(
-        description="Formatted visual ASCII blocking tree"
-    )
+    chain_representation: str = Field(description="Formatted visual ASCII blocking tree")
 
 
 class LockContentionReport(BaseModel):

@@ -121,9 +121,7 @@ def build_lock_contention_report(
         )
 
     # Root blockers: PIDs that are blocking others, but are NOT blocked themselves
-    root_pids = [
-        pid for pid in blocking_to_blocked if pid not in blocked_to_blocking
-    ]
+    root_pids = [pid for pid in blocking_to_blocked if pid not in blocked_to_blocking]
 
     # In case of cycles, fallback to any unvisited blocking pid
     if not root_pids and blocking_to_blocked:

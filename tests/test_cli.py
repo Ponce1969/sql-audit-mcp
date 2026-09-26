@@ -112,7 +112,12 @@ def test_json_output_is_valid_and_redacted(capsys):
     assert data["database"] == "db.example.com"
     assert "supersecret" not in out
     assert data["checks"] == [
-        "redundant", "hot", "low-usage", "invalid", "unindexed-fks", "dead-tuples"
+        "redundant",
+        "hot",
+        "low-usage",
+        "invalid",
+        "unindexed-fks",
+        "dead-tuples",
     ]
     assert data["summary"] == {
         "redundant_indexes": 1,
@@ -123,7 +128,12 @@ def test_json_output_is_valid_and_redacted(capsys):
         "autovacuum_dead_tuples": 0,
     }
     assert set(data["issues"]) == {
-        "redundant", "hot", "low-usage", "invalid", "unindexed-fks", "dead-tuples"
+        "redundant",
+        "hot",
+        "low-usage",
+        "invalid",
+        "unindexed-fks",
+        "dead-tuples",
     }
 
 
@@ -274,11 +284,10 @@ def test_low_usage_query_uses_threshold_1000(monkeypatch):
     auditor.run_audit(checks=["low-usage"])
     sql = store["low-usage"]
     # The threshold must be > 1000 and must NOT be the old > 100 pattern
-    assert "> 1000" in sql or "> %s" in sql, (
-        "Expected writes threshold of 1000 in low-usage query"
-    )
+    assert "> 1000" in sql or "> %s" in sql, "Expected writes threshold of 1000 in low-usage query"
     # Verify the old threshold is gone (literal 100 without 1000 prefix)
     import re
-    assert not re.search(r'>\s*100\b(?!0)', sql), (
+
+    assert not re.search(r">\s*100\b(?!0)", sql), (
         "Old threshold > 100 still present in low-usage query"
     )

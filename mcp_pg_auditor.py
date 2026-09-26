@@ -183,13 +183,9 @@ class AsyncPostgresHealthAuditor:
             if CheckName.AUTOVACUUM_DEAD_TUPLES.value in checks:
                 dead_tuples = await self._audit_autovacuum_dead_tuples(conn, schemas)
             if CheckName.HOT_FILLFACTOR.value in checks:
-                hot_issues = await self._audit_hot_and_fillfactor(
-                    conn, schemas, min_table_rows
-                )
+                hot_issues = await self._audit_hot_and_fillfactor(conn, schemas, min_table_rows)
             if CheckName.REDUNDANT_INDEXES.value in checks:
-                redundant = await self._audit_redundant_indexes(
-                    conn, schemas, min_size_bytes
-                )
+                redundant = await self._audit_redundant_indexes(conn, schemas, min_size_bytes)
             if CheckName.LOW_USAGE_INDEXES.value in checks:
                 low_usage = await self._audit_low_usage_indexes(
                     conn, schemas, min_size_bytes, min_table_rows
@@ -305,9 +301,7 @@ class AsyncPostgresHealthAuditor:
         min_ratio: float = 30.0,
         min_updates: int = 50,
     ) -> list[HotUpdateIssue]:
-        rows = await conn.fetch(
-            SQL_HOT_ASYNCPG, min_updates, min_ratio, min_table_rows, schemas
-        )
+        rows = await conn.fetch(SQL_HOT_ASYNCPG, min_updates, min_ratio, min_table_rows, schemas)
         issues: list[HotUpdateIssue] = []
         for r in rows:
             data = dict(r)
@@ -345,9 +339,7 @@ mcp = FastMCP("PostgreSQL Health Auditor")
 
 def resolve_dsn(db_alias: str) -> str:
     """Resolves DSN from environment without exposing credentials to MCP protocol."""
-    env_var = (
-        f"DB_{db_alias.upper()}_URL" if db_alias.lower() != "default" else "DATABASE_URL"
-    )
+    env_var = f"DB_{db_alias.upper()}_URL" if db_alias.lower() != "default" else "DATABASE_URL"
     dsn = os.getenv(env_var)
     if not dsn:
         raise ValueError(
@@ -480,12 +472,8 @@ async def _run_cli_main() -> None:
     parser = argparse.ArgumentParser(
         description="Deterministic PostgreSQL Health Auditor (CLI mode)"
     )
-    parser.add_argument(
-        "--dsn", default=None, help="PostgreSQL DSN (or via DATABASE_URL)"
-    )
-    parser.add_argument(
-        "--alias", default="default", help="Database alias for DB_{ALIAS}_URL"
-    )
+    parser.add_argument("--dsn", default=None, help="PostgreSQL DSN (or via DATABASE_URL)")
+    parser.add_argument("--alias", default="default", help="Database alias for DB_{ALIAS}_URL")
     parser.add_argument(
         "--schemas",
         default="public",
@@ -509,18 +497,14 @@ async def _run_cli_main() -> None:
         default=10,
         help="Connection timeout in seconds (default: 10)",
     )
-    parser.add_argument(
-        "--json", action="store_true", help="Output full report as formatted JSON"
-    )
+    parser.add_argument("--json", action="store_true", help="Output full report as formatted JSON")
     parser.add_argument(
         "--locks", action="store_true", help="Inspect lock contention and blocking trees"
     )
     parser.add_argument(
         "--bloat", action="store_true", help="Estimate physical bloat in tables and indexes"
     )
-    parser.add_argument(
-        "--explain", default=None, help="Query string to explain and audit"
-    )
+    parser.add_argument("--explain", default=None, help="Query string to explain and audit")
     parser.add_argument(
         "--analyze", action="store_true", help="Execute query in rolled-back tx for runtime stats"
     )
@@ -529,6 +513,7 @@ async def _run_cli_main() -> None:
     args = parser.parse_args(raw_args)
 
     from audit_pg import resolve_db_url  # local import avoids circular import at module load
+
     dsn = resolve_db_url(cli_url=args.dsn)
     if not dsn:
         dsn = resolve_dsn(args.alias)
@@ -570,7 +555,6 @@ async def _run_cli_main() -> None:
 
     schemas = [s.strip() for s in args.schemas.split(",") if s.strip()]
 
-
     start_time = time.perf_counter()
     report = await auditor.run_full_audit(
         schemas=schemas,
@@ -601,8 +585,7 @@ def _print_cli_summary(report: PostgresHealthReport) -> None:
     print(f"[1] Invalid Indexes (indisvalid = false): {len(report.invalid_indexes)}")
     for inv in report.invalid_indexes:
         print(
-            f"    - Table: {inv.child_table} | "
-            f"Index: {inv.invalid_index} (Size: {inv.index_size})"
+            f"    - Table: {inv.child_table} | Index: {inv.invalid_index} (Size: {inv.index_size})"
         )
 
     print(f"[2] Unindexed Foreign Keys: {len(report.unindexed_fks)}")
@@ -617,9 +600,7 @@ def _print_cli_summary(report: PostgresHealthReport) -> None:
             f"Dead tuples: {dt.dead_tuples:,} ({dt.dead_tuple_pct}%) | Live: {dt.live_tuples:,}"
         )
 
-    print(
-        f"[4] Broken HOT Updates / Fillfactor Issues: {len(report.hot_fillfactor_issues)}"
-    )
+    print(f"[4] Broken HOT Updates / Fillfactor Issues: {len(report.hot_fillfactor_issues)}")
     for hot in report.hot_fillfactor_issues:
         print(
             f"    - Table: {hot.table_name} | "
@@ -649,6 +630,7 @@ def _print_cli_summary(report: PostgresHealthReport) -> None:
 def run_mcp_cli() -> None:
     """Sync entry point for [project.scripts] — asyncio wrapper for _run_cli_main."""
     import asyncio
+
     asyncio.run(_run_cli_main())
 
 
@@ -659,4 +641,3 @@ if __name__ == "__main__":
         asyncio.run(_run_cli_main())
     else:
         mcp.run(transport="stdio")
-

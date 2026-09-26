@@ -123,12 +123,14 @@ def test_has_issues():
     assert audit_pg.has_issues(DatabaseHealthReport(hot_issues=[issue])) is True
     # Critical-only issue
     from audit_pg import InvalidIndexIssue
+
     inv = InvalidIndexIssue("t", "idx_bad", "10 MB")
     assert audit_pg.has_issues(DatabaseHealthReport(invalid_indexes=[inv])) is True
 
 
 def test_render_text_with_critical_issues():
     from audit_pg import DeadTuplesIssue, InvalidIndexIssue, UnindexedFKIssue
+
     report = DatabaseHealthReport(
         invalid_indexes=[InvalidIndexIssue("orders", "idx_orders_bad", "10 MB")],
         unindexed_fks=[
@@ -150,6 +152,7 @@ def test_render_text_with_critical_issues():
 
 def test_render_quiet_with_all_checks():
     from audit_pg import InvalidIndexIssue, UnindexedFKIssue
+
     report = DatabaseHealthReport(
         invalid_indexes=[InvalidIndexIssue("orders", "idx_bad", "10 MB")],
         unindexed_fks=[UnindexedFKIssue("items", "fk_items", "orders", "def")],
@@ -176,7 +179,7 @@ def test_hot_ratio_pct_accepts_native_float():
         table_name="orders",
         total_updates=200,
         hot_updates=100,
-        hot_ratio_pct=50.0,       # native float — no Decimal wrapper
+        hot_ratio_pct=50.0,  # native float — no Decimal wrapper
         fillfactor=100,
         fillfactor_warning=True,
         table_rows=50000,
