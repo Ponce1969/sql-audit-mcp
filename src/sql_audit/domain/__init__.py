@@ -7,6 +7,12 @@ from sql_audit.domain.diff import (
     FindingLifecycleState,
 )
 from sql_audit.domain.hasher import compute_evidence_id, compute_stable_finding_id
+from sql_audit.domain.locks import (
+    BlockingEdge,
+    LockContentionReport,
+    LockProcess,
+    LockTree,
+)
 from sql_audit.domain.models import (
     AuditReport,
     Evidence,
@@ -19,6 +25,7 @@ from sql_audit.domain.models import (
 __all__ = [
     "AuditDiff",
     "AuditReport",
+    "BlockingEdge",
     "ChangedFinding",
     "DiffSummary",
     "Evidence",
@@ -26,6 +33,9 @@ __all__ = [
     "Finding",
     "FindingLifecycleState",
     "JsonValue",
+    "LockContentionReport",
+    "LockProcess",
+    "LockTree",
     "Severity",
     "compute_evidence_id",
     "compute_stable_finding_id",

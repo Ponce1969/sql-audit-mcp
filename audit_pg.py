@@ -21,17 +21,20 @@ from dotenv import find_dotenv, load_dotenv
 
 from sql_audit.application import (
     AuditReport,
+    build_lock_contention_report,
     compare_audit_reports,
     convert_legacy_report_to_audit_report,
     render_diff_text,
+    render_lock_report_text,
 )
-from sql_audit.domain import Severity
+from sql_audit.domain import LockContentionReport, Severity
 from sql_audit.infrastructure.queries import (
     SQL_DEAD_TUPLES_ALL_PSYCOPG,
     SQL_DEAD_TUPLES_SCHEMAS_PSYCOPG,
     SQL_HOT_PSYCOPG,
     SQL_INVALID_INDEXES_ALL_PSYCOPG,
     SQL_INVALID_INDEXES_SCHEMAS_PSYCOPG,
+    SQL_LOCK_CONTENTION,
     SQL_LOW_USAGE_PSYCOPG,
     SQL_REDUNDANT_PSYCOPG,
     SQL_UNINDEXED_FKS_ALL_PSYCOPG,
@@ -222,6 +225,24 @@ class PostgresHealthAuditor:
                     unindexed_fks=unindexed_fks,
                     autovacuum_dead_tuples=autovacuum_dead_tuples,
                 )
+        finally:
+            conn.close()
+
+    def audit_locks(self) -> LockContentionReport:
+        """Inspects active lock contention and reconstructs blocking trees."""
+        if not HAS_PSYCOPG2:
+            raise RuntimeError("psycopg2 is not installed. Run: uv add psycopg2-binary")
+
+        try:
+            conn = psycopg2.connect(self.db_url, connect_timeout=self.connect_timeout)
+        except Exception as exc:  # noqa: BLE001
+            raise DatabaseConnectionError(str(exc)) from exc
+
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(SQL_LOCK_CONTENTION)
+                rows = [dict(r) for r in cur.fetchall()]
+                return build_lock_contention_report(rows)
         finally:
             conn.close()
 
@@ -678,6 +699,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only report HOT/low-usage issues for tables with at least N live rows "
         "(default: 10000); 0 disables the threshold",
     )
+    parser.add_argument(
+        "--locks",
+        action="store_true",
+        help="Inspect active lock contention and reconstruct blocking trees via pg_locks",
+    )
     return parser
 
 
@@ -709,8 +735,28 @@ def main(
         )
         return 1
 
-    selected_checks = checks if checks is not None else list(ALL_CHECKS)
     auditor = auditor_factory(db_url=db_url, connect_timeout=args.timeout)
+
+    if args.locks:
+        try:
+            lock_report = auditor.audit_locks()
+        except DatabaseConnectionError as exc:
+            print(f"Connection failed: {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"Failed to inspect locks: {exc}", file=sys.stderr)
+            return 1
+
+        if args.canonical_json or args.json:
+            print(lock_report.model_dump_json(indent=2))
+        else:
+            print(render_lock_report_text(lock_report))
+
+        if lock_report.total_blocked_processes > 0:
+            return 3
+        return 0
+
+    selected_checks = checks if checks is not None else list(ALL_CHECKS)
     try:
         report = auditor.run_audit(
             min_hot_ratio_pct=args.min_hot_ratio,

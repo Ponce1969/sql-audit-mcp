@@ -348,3 +348,33 @@ WHERE n.nspname = ANY($1)
   AND t.n_live_tup >= $4
 ORDER BY pg_relation_size(i.oid) DESC;
 """
+
+# Query 7: Lock Contention and Blocking Graph
+SQL_LOCK_CONTENTION = """
+SELECT
+    blocked.pid AS blocked_pid,
+    COALESCE(blocked.usename, '') AS blocked_user,
+    COALESCE(blocked.application_name, '') AS blocked_app,
+    COALESCE(blocked.client_addr::text, '') AS blocked_client_addr,
+    EXTRACT(EPOCH FROM (now() - blocked.query_start))::float AS blocked_duration_sec,
+    EXTRACT(EPOCH FROM (now() - blocked.xact_start))::float AS blocked_xact_age_sec,
+    COALESCE(blocked.wait_event_type, '') AS blocked_wait_event_type,
+    COALESCE(blocked.wait_event, '') AS blocked_wait_event,
+    COALESCE(blocked.state, '') AS blocked_state,
+    COALESCE(blocked.query, '') AS blocked_query,
+    blocking_pids.blocking_pid,
+    COALESCE(blocking.usename, '') AS blocking_user,
+    COALESCE(blocking.application_name, '') AS blocking_app,
+    COALESCE(blocking.client_addr::text, '') AS blocking_client_addr,
+    EXTRACT(EPOCH FROM (now() - blocking.query_start))::float AS blocking_duration_sec,
+    EXTRACT(EPOCH FROM (now() - blocking.xact_start))::float AS blocking_xact_age_sec,
+    COALESCE(blocking.state, '') AS blocking_state,
+    COALESCE(blocking.wait_event_type, '') AS blocking_wait_event_type,
+    COALESCE(blocking.wait_event, '') AS blocking_wait_event,
+    COALESCE(blocking.query, '') AS blocking_query
+FROM pg_stat_activity blocked
+CROSS JOIN LATERAL unnest(pg_blocking_pids(blocked.pid)) AS blocking_pids(blocking_pid)
+JOIN pg_stat_activity blocking ON blocking.pid = blocking_pids.blocking_pid
+WHERE NOT blocked.pid = pg_backend_pid()
+ORDER BY blocked_duration_sec DESC;
+"""

@@ -19,11 +19,18 @@ from dotenv import find_dotenv, load_dotenv
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
-from sql_audit.application import AuditReport, convert_legacy_report_to_audit_report
+from sql_audit.application import (
+    AuditReport,
+    build_lock_contention_report,
+    convert_legacy_report_to_audit_report,
+    render_lock_report_text,
+)
+from sql_audit.domain import LockContentionReport
 from sql_audit.infrastructure.queries import (
     SQL_DEAD_TUPLES_ASYNCPG,
     SQL_HOT_ASYNCPG,
     SQL_INVALID_INDEXES_ASYNCPG,
+    SQL_LOCK_CONTENTION,
     SQL_LOW_USAGE_ASYNCPG,
     SQL_REDUNDANT_ASYNCPG,
     SQL_UNINDEXED_FKS_ASYNCPG,
@@ -198,6 +205,16 @@ class AsyncPostgresHealthAuditor:
         finally:
             await conn.close()
 
+    async def audit_locks(self) -> LockContentionReport:
+        """Inspects active lock contention and reconstructs blocking trees."""
+        conn = await asyncpg.connect(self.dsn, timeout=self.connect_timeout)
+        try:
+            records = await conn.fetch(SQL_LOCK_CONTENTION)
+            rows = [dict(r) for r in records]
+            return build_lock_contention_report(rows)
+        finally:
+            await conn.close()
+
     async def _audit_invalid_indexes(
         self, conn: asyncpg.Connection, schemas: list[str]
     ) -> list[InvalidIndexIssue]:
@@ -320,6 +337,26 @@ async def pg_health_audit(
     return report
 
 
+@mcp.tool(
+    name="pg_locks",
+    description=(
+        "Inspects active lock contention and reconstructs blocking trees in PostgreSQL. "
+        "Identifies root blocking sessions, blocked processes, lock wait durations, and queries."
+    ),
+)
+async def pg_locks(
+    db_alias: str = "default",
+    connect_timeout: int | None = None,
+) -> LockContentionReport:
+    """Inspects active lock contention and blocking trees."""
+    dsn = resolve_dsn(db_alias)
+    auditor = AsyncPostgresHealthAuditor(
+        dsn=dsn,
+        connect_timeout=connect_timeout if connect_timeout is not None else 10,
+    )
+    return await auditor.audit_locks()
+
+
 async def _run_cli_main() -> None:
     import argparse
 
@@ -358,6 +395,9 @@ async def _run_cli_main() -> None:
     parser.add_argument(
         "--json", action="store_true", help="Output full report as formatted JSON"
     )
+    parser.add_argument(
+        "--locks", action="store_true", help="Inspect lock contention and blocking trees"
+    )
 
     raw_args = [a for a in sys.argv[1:] if a not in ("--cli", "-c")]
     args = parser.parse_args(raw_args)
@@ -367,8 +407,18 @@ async def _run_cli_main() -> None:
     if not dsn:
         dsn = resolve_dsn(args.alias)
 
-    schemas = [s.strip() for s in args.schemas.split(",") if s.strip()]
     auditor = AsyncPostgresHealthAuditor(dsn=dsn, connect_timeout=args.timeout)
+
+    if args.locks:
+        lock_report = await auditor.audit_locks()
+        if args.json:
+            print(lock_report.model_dump_json(indent=2))
+        else:
+            print(render_lock_report_text(lock_report))
+        return
+
+    schemas = [s.strip() for s in args.schemas.split(",") if s.strip()]
+
 
     start_time = time.perf_counter()
     report = await auditor.run_full_audit(

@@ -74,21 +74,32 @@ sql-audit --schema public,analytics --min-table-rows 1000 --min-size 10000000
 # JSON output for machine consumption
 sql-audit --json
 
+# Canonical JSON output (structured AuditReport contract)
+sql-audit --canonical-json
+
+# Differential audit against a previous baseline report
+sql-audit --diff previous_audit.json
+
+# Real-time lock contention & blocking tree inspection
+sql-audit --locks
+
 # Quiet mode (summary counts only)
 sql-audit --quiet
 ```
 
 #### Exit Codes (CI / Pipeline Ready)
-- `0`: All checks passed. Database is healthy.
+- `0`: All checks passed. Database is healthy (or clean locks).
 - `1`: Configuration error or connection failure.
 - `2`: Optimization findings detected (redundant indexes, low HOT ratio, low-usage indexes).
-- `3`: **Critical issues detected** (invalid indexes, unindexed foreign keys, or excessive dead tuple bloat).
+- `3`: **Critical issues detected** (invalid indexes, unindexed foreign keys, excessive dead tuple bloat, or active blocking lock contention).
 
 ---
 
 ### 2. FastMCP Server (`mcp_pg_auditor.py` / `sql-audit-mcp`)
 
-The MCP server exposes a clean, flat tool interface: `pg_health_audit`.
+The MCP server exposes two deterministic tools:
+- `pg_health_audit`: Full evaluation of up to 6 performance anti-patterns.
+- `pg_locks`: Real-time inspection of lock contention with recursive blocking tree reconstruction.
 
 #### Client Configuration Examples
 
