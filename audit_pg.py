@@ -19,7 +19,13 @@ from urllib.parse import quote_plus, urlsplit
 
 from dotenv import find_dotenv, load_dotenv
 
-from sql_audit.application import AuditReport, convert_legacy_report_to_audit_report
+from sql_audit.application import (
+    AuditReport,
+    compare_audit_reports,
+    convert_legacy_report_to_audit_report,
+    render_diff_text,
+)
+from sql_audit.domain import Severity
 from sql_audit.infrastructure.queries import (
     SQL_DEAD_TUPLES_ALL_PSYCOPG,
     SQL_DEAD_TUPLES_SCHEMAS_PSYCOPG,
@@ -637,6 +643,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit canonical domain AuditReport JSON with stable finding and evidence IDs",
     )
     parser.add_argument(
+        "--diff",
+        metavar="PREVIOUS_AUDIT_JSON",
+        help="Path to previous AuditReport JSON file to compute differential changes against",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=DEFAULT_CONNECT_TIMEOUT,
@@ -716,6 +727,34 @@ def main(
     except Exception as exc:  # noqa: BLE001
         print(f"Failed to audit database: {exc}", file=sys.stderr)
         return 1
+
+    if args.diff:
+        try:
+            with open(args.diff, encoding="utf-8") as f:
+                prev_data = json.load(f)
+            prev_report = AuditReport.model_validate(prev_data)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error loading previous audit report: {exc}", file=sys.stderr)
+            return 1
+
+        curr_report = report.to_audit_report(
+            database=redact_db_url(db_url),
+            checks=selected_checks,
+            schemas=schemas,
+            min_size_bytes=args.min_size,
+            min_table_rows=args.min_table_rows,
+        )
+        diff = compare_audit_reports(prev_report, curr_report)
+
+        if args.canonical_json or args.json:
+            print(diff.model_dump_json(indent=2))
+        else:
+            print(render_diff_text(diff))
+
+        has_new_critical = any(f.severity == Severity.CRITICAL for f in diff.new_findings)
+        if has_new_critical:
+            return 3
+        return 2 if (diff.new_findings or diff.changed_findings) else 0
 
     if args.canonical_json:
         audit_report = report.to_audit_report(

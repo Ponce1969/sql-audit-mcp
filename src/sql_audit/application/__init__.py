@@ -1,3 +1,7 @@
+from sql_audit.application.diff_service import (
+    compare_audit_reports,
+    render_diff_text,
+)
 from sql_audit.application.mapping import (
     build_audit_report,
     convert_legacy_report_to_audit_report,
@@ -13,6 +17,7 @@ from sql_audit.domain.models import AuditReport
 __all__ = [
     "AuditReport",
     "build_audit_report",
+    "compare_audit_reports",
     "convert_legacy_report_to_audit_report",
     "map_dead_tuples_to_finding",
     "map_hot_to_finding",
@@ -20,4 +25,5 @@ __all__ = [
     "map_low_usage_index_to_finding",
     "map_redundant_index_to_finding",
     "map_unindexed_fk_to_finding",
+    "render_diff_text",
 ]
