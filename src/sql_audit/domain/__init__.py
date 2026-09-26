@@ -1,5 +1,10 @@
 """Domain models and hashing for SQL Audit."""
 
+from sql_audit.domain.bloat import (
+    BloatReport,
+    IndexBloat,
+    TableBloat,
+)
 from sql_audit.domain.diff import (
     AuditDiff,
     ChangedFinding,
@@ -26,17 +31,20 @@ __all__ = [
     "AuditDiff",
     "AuditReport",
     "BlockingEdge",
+    "BloatReport",
     "ChangedFinding",
     "DiffSummary",
     "Evidence",
     "ExecutionMetadata",
     "Finding",
     "FindingLifecycleState",
+    "IndexBloat",
     "JsonValue",
     "LockContentionReport",
     "LockProcess",
     "LockTree",
     "Severity",
+    "TableBloat",
     "compute_evidence_id",
     "compute_stable_finding_id",
 ]

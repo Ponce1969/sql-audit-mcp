@@ -83,23 +83,27 @@ sql-audit --diff previous_audit.json
 # Real-time lock contention & blocking tree inspection
 sql-audit --locks
 
+# Physical disk bloat estimation for tables and B-tree indexes
+sql-audit --bloat --min-bloat-bytes 10000000 --min-bloat-ratio 20.0
+
 # Quiet mode (summary counts only)
 sql-audit --quiet
 ```
 
 #### Exit Codes (CI / Pipeline Ready)
-- `0`: All checks passed. Database is healthy (or clean locks).
+- `0`: All checks passed. Database is healthy (or clean locks / no bloat).
 - `1`: Configuration error or connection failure.
-- `2`: Optimization findings detected (redundant indexes, low HOT ratio, low-usage indexes).
+- `2`: Optimization findings detected (redundant indexes, low HOT ratio, low-usage indexes, or physical bloat).
 - `3`: **Critical issues detected** (invalid indexes, unindexed foreign keys, excessive dead tuple bloat, or active blocking lock contention).
 
 ---
 
 ### 2. FastMCP Server (`mcp_pg_auditor.py` / `sql-audit-mcp`)
 
-The MCP server exposes two deterministic tools:
+The MCP server exposes three deterministic tools:
 - `pg_health_audit`: Full evaluation of up to 6 performance anti-patterns.
 - `pg_locks`: Real-time inspection of lock contention with recursive blocking tree reconstruction.
+- `pg_bloat`: Statistical physical disk bloat estimation for tables and B-tree indexes without requiring `pgstattuple`.
 
 #### Client Configuration Examples
 

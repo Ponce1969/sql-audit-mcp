@@ -21,18 +21,22 @@ from pydantic import BaseModel, Field
 
 from sql_audit.application import (
     AuditReport,
+    build_bloat_report,
     build_lock_contention_report,
     convert_legacy_report_to_audit_report,
+    render_bloat_report_text,
     render_lock_report_text,
 )
-from sql_audit.domain import LockContentionReport
+from sql_audit.domain import BloatReport, LockContentionReport
 from sql_audit.infrastructure.queries import (
     SQL_DEAD_TUPLES_ASYNCPG,
     SQL_HOT_ASYNCPG,
+    SQL_INDEX_BLOAT_ASYNCPG,
     SQL_INVALID_INDEXES_ASYNCPG,
     SQL_LOCK_CONTENTION,
     SQL_LOW_USAGE_ASYNCPG,
     SQL_REDUNDANT_ASYNCPG,
+    SQL_TABLE_BLOAT_ASYNCPG,
     SQL_UNINDEXED_FKS_ASYNCPG,
 )
 
@@ -215,6 +219,31 @@ class AsyncPostgresHealthAuditor:
         finally:
             await conn.close()
 
+    async def audit_bloat(
+        self,
+        schemas: list[str] | None = None,
+        min_bloat_bytes: int = 10_000_000,
+        min_bloat_ratio_pct: float = 20.0,
+        db_alias: str = "default",
+    ) -> BloatReport:
+        """Estimates physical bloat for tables and B-tree indexes from catalog statistics."""
+        effective_schemas = schemas if schemas is not None else ["public"]
+        conn = await asyncpg.connect(self.dsn, timeout=self.connect_timeout)
+        try:
+            tbl_records = await conn.fetch(SQL_TABLE_BLOAT_ASYNCPG, effective_schemas)
+            idx_records = await conn.fetch(SQL_INDEX_BLOAT_ASYNCPG, effective_schemas)
+            tbl_rows = [dict(r) for r in tbl_records]
+            idx_rows = [dict(r) for r in idx_records]
+            return build_bloat_report(
+                table_rows=tbl_rows,
+                index_rows=idx_rows,
+                database=db_alias,
+                min_bloat_bytes=min_bloat_bytes,
+                min_bloat_ratio_pct=min_bloat_ratio_pct,
+            )
+        finally:
+            await conn.close()
+
     async def _audit_invalid_indexes(
         self, conn: asyncpg.Connection, schemas: list[str]
     ) -> list[InvalidIndexIssue]:
@@ -357,6 +386,35 @@ async def pg_locks(
     return await auditor.audit_locks()
 
 
+@mcp.tool(
+    name="pg_bloat",
+    description=(
+        "Estimates physical disk bloat for PostgreSQL tables and B-tree indexes from "
+        "catalog statistics. Calculates expected pages vs actual pages, wasted bytes, "
+        "and bloat percentage."
+    ),
+)
+async def pg_bloat(
+    schemas: list[str] | None = None,
+    min_bloat_bytes: int = 10_000_000,
+    min_bloat_ratio_pct: float = 20.0,
+    db_alias: str = "default",
+    connect_timeout: int | None = None,
+) -> BloatReport:
+    """Estimates physical bloat for tables and B-tree indexes."""
+    dsn = resolve_dsn(db_alias)
+    auditor = AsyncPostgresHealthAuditor(
+        dsn=dsn,
+        connect_timeout=connect_timeout if connect_timeout is not None else 10,
+    )
+    return await auditor.audit_bloat(
+        schemas=schemas,
+        min_bloat_bytes=min_bloat_bytes,
+        min_bloat_ratio_pct=min_bloat_ratio_pct,
+        db_alias=db_alias,
+    )
+
+
 async def _run_cli_main() -> None:
     import argparse
 
@@ -398,6 +456,9 @@ async def _run_cli_main() -> None:
     parser.add_argument(
         "--locks", action="store_true", help="Inspect lock contention and blocking trees"
     )
+    parser.add_argument(
+        "--bloat", action="store_true", help="Estimate physical bloat in tables and indexes"
+    )
 
     raw_args = [a for a in sys.argv[1:] if a not in ("--cli", "-c")]
     args = parser.parse_args(raw_args)
@@ -415,6 +476,19 @@ async def _run_cli_main() -> None:
             print(lock_report.model_dump_json(indent=2))
         else:
             print(render_lock_report_text(lock_report))
+        return
+
+    if args.bloat:
+        schemas = [s.strip() for s in args.schemas.split(",") if s.strip()]
+        bloat_report = await auditor.audit_bloat(
+            schemas=schemas,
+            min_bloat_bytes=args.min_size_bytes,
+            db_alias=args.alias,
+        )
+        if args.json:
+            print(bloat_report.model_dump_json(indent=2))
+        else:
+            print(render_bloat_report_text(bloat_report))
         return
 
     schemas = [s.strip() for s in args.schemas.split(",") if s.strip()]

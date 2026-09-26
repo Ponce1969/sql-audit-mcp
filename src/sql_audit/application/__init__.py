@@ -1,3 +1,8 @@
+from sql_audit.application.bloat_service import (
+    bloat_report_to_findings,
+    build_bloat_report,
+    render_bloat_report_text,
+)
 from sql_audit.application.diff_service import (
     compare_audit_reports,
     render_diff_text,
@@ -21,7 +26,9 @@ from sql_audit.domain.models import AuditReport
 
 __all__ = [
     "AuditReport",
+    "bloat_report_to_findings",
     "build_audit_report",
+    "build_bloat_report",
     "build_lock_contention_report",
     "compare_audit_reports",
     "convert_legacy_report_to_audit_report",
@@ -32,6 +39,7 @@ __all__ = [
     "map_low_usage_index_to_finding",
     "map_redundant_index_to_finding",
     "map_unindexed_fk_to_finding",
+    "render_bloat_report_text",
     "render_diff_text",
     "render_lock_report_text",
 ]

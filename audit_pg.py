@@ -21,22 +21,28 @@ from dotenv import find_dotenv, load_dotenv
 
 from sql_audit.application import (
     AuditReport,
+    build_bloat_report,
     build_lock_contention_report,
     compare_audit_reports,
     convert_legacy_report_to_audit_report,
+    render_bloat_report_text,
     render_diff_text,
     render_lock_report_text,
 )
-from sql_audit.domain import LockContentionReport, Severity
+from sql_audit.domain import BloatReport, LockContentionReport, Severity
 from sql_audit.infrastructure.queries import (
     SQL_DEAD_TUPLES_ALL_PSYCOPG,
     SQL_DEAD_TUPLES_SCHEMAS_PSYCOPG,
     SQL_HOT_PSYCOPG,
+    SQL_INDEX_BLOAT_ALL_PSYCOPG,
+    SQL_INDEX_BLOAT_SCHEMAS_PSYCOPG,
     SQL_INVALID_INDEXES_ALL_PSYCOPG,
     SQL_INVALID_INDEXES_SCHEMAS_PSYCOPG,
     SQL_LOCK_CONTENTION,
     SQL_LOW_USAGE_PSYCOPG,
     SQL_REDUNDANT_PSYCOPG,
+    SQL_TABLE_BLOAT_ALL_PSYCOPG,
+    SQL_TABLE_BLOAT_SCHEMAS_PSYCOPG,
     SQL_UNINDEXED_FKS_ALL_PSYCOPG,
     SQL_UNINDEXED_FKS_SCHEMAS_PSYCOPG,
 )
@@ -243,6 +249,44 @@ class PostgresHealthAuditor:
                 cur.execute(SQL_LOCK_CONTENTION)
                 rows = [dict(r) for r in cur.fetchall()]
                 return build_lock_contention_report(rows)
+        finally:
+            conn.close()
+
+    def audit_bloat(
+        self,
+        schemas: list[str] | None = None,
+        min_bloat_bytes: int = 10_000_000,
+        min_bloat_ratio_pct: float = 20.0,
+    ) -> BloatReport:
+        """Estimates physical bloat for tables and B-tree indexes from catalog statistics."""
+        if not HAS_PSYCOPG2:
+            raise RuntimeError("psycopg2 is not installed. Run: uv add psycopg2-binary")
+
+        try:
+            conn = psycopg2.connect(self.db_url, connect_timeout=self.connect_timeout)
+        except Exception as exc:  # noqa: BLE001
+            raise DatabaseConnectionError(str(exc)) from exc
+
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                if schemas:
+                    cur.execute(SQL_TABLE_BLOAT_SCHEMAS_PSYCOPG, [schemas])
+                    tbl_rows = [dict(r) for r in cur.fetchall()]
+                    cur.execute(SQL_INDEX_BLOAT_SCHEMAS_PSYCOPG, [schemas])
+                    idx_rows = [dict(r) for r in cur.fetchall()]
+                else:
+                    cur.execute(SQL_TABLE_BLOAT_ALL_PSYCOPG)
+                    tbl_rows = [dict(r) for r in cur.fetchall()]
+                    cur.execute(SQL_INDEX_BLOAT_ALL_PSYCOPG)
+                    idx_rows = [dict(r) for r in cur.fetchall()]
+
+                return build_bloat_report(
+                    table_rows=tbl_rows,
+                    index_rows=idx_rows,
+                    database=redact_db_url(self.db_url),
+                    min_bloat_bytes=min_bloat_bytes,
+                    min_bloat_ratio_pct=min_bloat_ratio_pct,
+                )
         finally:
             conn.close()
 
@@ -704,6 +748,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Inspect active lock contention and reconstruct blocking trees via pg_locks",
     )
+    parser.add_argument(
+        "--bloat",
+        action="store_true",
+        help="Estimate physical bloat in tables and B-tree indexes from catalog statistics",
+    )
+    parser.add_argument(
+        "--min-bloat-bytes",
+        type=int,
+        default=10_000_000,
+        help="Minimum wasted bytes to flag as bloat (default: 10000000 / 10MB)",
+    )
+    parser.add_argument(
+        "--min-bloat-ratio",
+        type=float,
+        default=20.0,
+        help="Minimum bloat percentage to flag as bloat (default: 20.0)",
+    )
     return parser
 
 
@@ -755,6 +816,30 @@ def main(
         if lock_report.total_blocked_processes > 0:
             return 3
         return 0
+
+    if args.bloat:
+        try:
+            bloat_report = auditor.audit_bloat(
+                schemas=schemas,
+                min_bloat_bytes=args.min_bloat_bytes,
+                min_bloat_ratio_pct=args.min_bloat_ratio,
+            )
+        except DatabaseConnectionError as exc:
+            print(f"Connection failed: {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"Failed to estimate bloat: {exc}", file=sys.stderr)
+            return 1
+
+        if args.canonical_json or args.json:
+            print(bloat_report.model_dump_json(indent=2))
+        else:
+            print(render_bloat_report_text(bloat_report))
+
+        has_bloat = any(t.is_bloated for t in bloat_report.tables) or any(
+            i.is_bloated for i in bloat_report.indexes
+        )
+        return 2 if has_bloat else 0
 
     selected_checks = checks if checks is not None else list(ALL_CHECKS)
     try:

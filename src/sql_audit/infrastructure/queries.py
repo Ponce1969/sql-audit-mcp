@@ -378,3 +378,449 @@ JOIN pg_stat_activity blocking ON blocking.pid = blocking_pids.blocking_pid
 WHERE NOT blocked.pid = pg_backend_pid()
 ORDER BY blocked_duration_sec DESC;
 """
+
+# Query 8: Physical Table Bloat Estimation
+SQL_TABLE_BLOAT_ALL_PSYCOPG = """
+WITH constants AS (
+    SELECT
+        current_setting('block_size')::numeric AS bs,
+        24 AS page_hdr,
+        24 AS tpl_hdr,
+        8 AS ma
+),
+table_stats AS (
+    SELECT
+        n.nspname AS schema_name,
+        c.relname AS table_name,
+        c.oid AS table_oid,
+        c.relpages,
+        c.reltuples,
+        COALESCE(
+            1 + COUNT(s.attname) / 8,
+            0
+        ) AS null_hdr,
+        COALESCE(
+            SUM(
+                (1.0 - COALESCE(s.null_frac, 0.0)) * COALESCE(s.avg_width, 1024)
+            ),
+            1024
+        ) AS data_width
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname
+    WHERE c.relkind IN ('r', 'm')
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+      AND c.relpages > 0
+    GROUP BY n.nspname, c.relname, c.oid, c.relpages, c.reltuples
+),
+table_est AS (
+    SELECT
+        ts.schema_name,
+        ts.table_name,
+        ts.relpages,
+        ts.reltuples,
+        k.bs,
+        (k.bs * ts.relpages)::bigint AS table_size_bytes,
+        CEIL(
+            ts.reltuples / NULLIF(
+                FLOOR(
+                    (k.bs - k.page_hdr) /
+                    NULLIF(
+                        CEIL((k.tpl_hdr + ts.null_hdr + ts.data_width)::numeric / k.ma) * k.ma + 4,
+                        0
+                    )
+                ),
+                0
+            )
+        )::bigint AS expected_pages
+    FROM table_stats ts
+    CROSS JOIN constants k
+)
+SELECT
+    schema_name,
+    table_name,
+    table_size_bytes,
+    (expected_pages * bs)::bigint AS expected_size_bytes,
+    GREATEST(0, (table_size_bytes - (expected_pages * bs)::bigint)) AS bloat_bytes,
+    ROUND(
+        (
+            GREATEST(0, (table_size_bytes - (expected_pages * bs)::bigint))::numeric
+            / NULLIF(table_size_bytes, 0)
+            * 100
+        )::numeric,
+        2
+    )::float AS bloat_ratio_pct
+FROM table_est
+ORDER BY bloat_bytes DESC;
+"""
+
+SQL_TABLE_BLOAT_SCHEMAS_PSYCOPG = """
+WITH constants AS (
+    SELECT
+        current_setting('block_size')::numeric AS bs,
+        24 AS page_hdr,
+        24 AS tpl_hdr,
+        8 AS ma
+),
+table_stats AS (
+    SELECT
+        n.nspname AS schema_name,
+        c.relname AS table_name,
+        c.oid AS table_oid,
+        c.relpages,
+        c.reltuples,
+        COALESCE(
+            1 + COUNT(s.attname) / 8,
+            0
+        ) AS null_hdr,
+        COALESCE(
+            SUM(
+                (1.0 - COALESCE(s.null_frac, 0.0)) * COALESCE(s.avg_width, 1024)
+            ),
+            1024
+        ) AS data_width
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname
+    WHERE c.relkind IN ('r', 'm')
+      AND n.nspname = ANY(%s)
+      AND c.relpages > 0
+    GROUP BY n.nspname, c.relname, c.oid, c.relpages, c.reltuples
+),
+table_est AS (
+    SELECT
+        ts.schema_name,
+        ts.table_name,
+        ts.relpages,
+        ts.reltuples,
+        k.bs,
+        (k.bs * ts.relpages)::bigint AS table_size_bytes,
+        CEIL(
+            ts.reltuples / NULLIF(
+                FLOOR(
+                    (k.bs - k.page_hdr) /
+                    NULLIF(
+                        CEIL((k.tpl_hdr + ts.null_hdr + ts.data_width)::numeric / k.ma) * k.ma + 4,
+                        0
+                    )
+                ),
+                0
+            )
+        )::bigint AS expected_pages
+    FROM table_stats ts
+    CROSS JOIN constants k
+)
+SELECT
+    schema_name,
+    table_name,
+    table_size_bytes,
+    (expected_pages * bs)::bigint AS expected_size_bytes,
+    GREATEST(0, (table_size_bytes - (expected_pages * bs)::bigint)) AS bloat_bytes,
+    ROUND(
+        (
+            GREATEST(0, (table_size_bytes - (expected_pages * bs)::bigint))::numeric
+            / NULLIF(table_size_bytes, 0)
+            * 100
+        )::numeric,
+        2
+    )::float AS bloat_ratio_pct
+FROM table_est
+ORDER BY bloat_bytes DESC;
+"""
+
+SQL_TABLE_BLOAT_ASYNCPG = """
+WITH constants AS (
+    SELECT
+        current_setting('block_size')::numeric AS bs,
+        24 AS page_hdr,
+        24 AS tpl_hdr,
+        8 AS ma
+),
+table_stats AS (
+    SELECT
+        n.nspname AS schema_name,
+        c.relname AS table_name,
+        c.oid AS table_oid,
+        c.relpages,
+        c.reltuples,
+        COALESCE(
+            1 + COUNT(s.attname) / 8,
+            0
+        ) AS null_hdr,
+        COALESCE(
+            SUM(
+                (1.0 - COALESCE(s.null_frac, 0.0)) * COALESCE(s.avg_width, 1024)
+            ),
+            1024
+        ) AS data_width
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname
+    WHERE c.relkind IN ('r', 'm')
+      AND n.nspname = ANY($1)
+      AND c.relpages > 0
+    GROUP BY n.nspname, c.relname, c.oid, c.relpages, c.reltuples
+),
+table_est AS (
+    SELECT
+        ts.schema_name,
+        ts.table_name,
+        ts.relpages,
+        ts.reltuples,
+        k.bs,
+        (k.bs * ts.relpages)::bigint AS table_size_bytes,
+        CEIL(
+            ts.reltuples / NULLIF(
+                FLOOR(
+                    (k.bs - k.page_hdr) /
+                    NULLIF(
+                        CEIL((k.tpl_hdr + ts.null_hdr + ts.data_width)::numeric / k.ma) * k.ma + 4,
+                        0
+                    )
+                ),
+                0
+            )
+        )::bigint AS expected_pages
+    FROM table_stats ts
+    CROSS JOIN constants k
+)
+SELECT
+    schema_name,
+    table_name,
+    table_size_bytes,
+    (expected_pages * bs)::bigint AS expected_size_bytes,
+    GREATEST(0, (table_size_bytes - (expected_pages * bs)::bigint)) AS bloat_bytes,
+    ROUND(
+        (
+            GREATEST(0, (table_size_bytes - (expected_pages * bs)::bigint))::numeric
+            / NULLIF(table_size_bytes, 0)
+            * 100
+        )::numeric,
+        2
+    )::float AS bloat_ratio_pct
+FROM table_est
+ORDER BY bloat_bytes DESC;
+"""
+
+# Query 9: Physical B-Tree Index Bloat Estimation
+SQL_INDEX_BLOAT_ALL_PSYCOPG = """
+WITH constants AS (
+    SELECT
+        current_setting('block_size')::numeric AS bs,
+        40 AS page_hdr,
+        8 AS tpl_hdr,
+        8 AS ma
+),
+index_stats AS (
+    SELECT
+        n.nspname AS schema_name,
+        c.relname AS table_name,
+        i.relname AS index_name,
+        i.relpages,
+        i.reltuples,
+        COALESCE(
+            SUM(
+                (1.0 - COALESCE(s.null_frac, 0.0)) * COALESCE(s.avg_width, 8)
+            ),
+            16
+        ) AS data_width
+    FROM pg_class i
+    JOIN pg_index x ON x.indexrelid = i.oid
+    JOIN pg_class c ON c.oid = x.indrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_am am ON am.oid = i.relam AND am.amname = 'btree'
+    LEFT JOIN pg_stats s ON s.schemaname = n.nspname
+                        AND s.tablename = c.relname
+                        AND s.attname = ANY(
+                            SELECT a.attname
+                            FROM pg_attribute a
+                            WHERE a.attrelid = c.oid
+                              AND a.attnum = ANY(string_to_array(x.indkey::text, ' ')::int[])
+                        )
+    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+      AND i.relpages > 0
+    GROUP BY n.nspname, c.relname, i.relname, i.relpages, i.reltuples
+),
+index_est AS (
+    SELECT
+        is_s.schema_name,
+        is_s.table_name,
+        is_s.index_name,
+        is_s.relpages,
+        is_s.reltuples,
+        k.bs,
+        (k.bs * is_s.relpages)::bigint AS index_size_bytes,
+        CEIL(
+            (is_s.reltuples * (
+                CEIL((k.tpl_hdr + is_s.data_width)::numeric / k.ma) * k.ma + 4
+            )) / NULLIF((k.bs - k.page_hdr) * 0.70, 0)
+        )::bigint AS expected_pages
+    FROM index_stats is_s
+    CROSS JOIN constants k
+)
+SELECT
+    schema_name,
+    table_name,
+    index_name,
+    index_size_bytes,
+    (expected_pages * bs)::bigint AS expected_size_bytes,
+    GREATEST(0, (index_size_bytes - (expected_pages * bs)::bigint)) AS bloat_bytes,
+    ROUND(
+        (
+            GREATEST(0, (index_size_bytes - (expected_pages * bs)::bigint))::numeric
+            / NULLIF(index_size_bytes, 0)
+            * 100
+        )::numeric,
+        2
+    )::float AS bloat_ratio_pct
+FROM index_est
+ORDER BY bloat_bytes DESC;
+"""
+
+SQL_INDEX_BLOAT_SCHEMAS_PSYCOPG = """
+WITH constants AS (
+    SELECT
+        current_setting('block_size')::numeric AS bs,
+        40 AS page_hdr,
+        8 AS tpl_hdr,
+        8 AS ma
+),
+index_stats AS (
+    SELECT
+        n.nspname AS schema_name,
+        c.relname AS table_name,
+        i.relname AS index_name,
+        i.relpages,
+        i.reltuples,
+        COALESCE(
+            SUM(
+                (1.0 - COALESCE(s.null_frac, 0.0)) * COALESCE(s.avg_width, 8)
+            ),
+            16
+        ) AS data_width
+    FROM pg_class i
+    JOIN pg_index x ON x.indexrelid = i.oid
+    JOIN pg_class c ON c.oid = x.indrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_am am ON am.oid = i.relam AND am.amname = 'btree'
+    LEFT JOIN pg_stats s ON s.schemaname = n.nspname
+                        AND s.tablename = c.relname
+                        AND s.attname = ANY(
+                            SELECT a.attname
+                            FROM pg_attribute a
+                            WHERE a.attrelid = c.oid
+                              AND a.attnum = ANY(string_to_array(x.indkey::text, ' ')::int[])
+                        )
+    WHERE n.nspname = ANY(%s)
+      AND i.relpages > 0
+    GROUP BY n.nspname, c.relname, i.relname, i.relpages, i.reltuples
+),
+index_est AS (
+    SELECT
+        is_s.schema_name,
+        is_s.table_name,
+        is_s.index_name,
+        is_s.relpages,
+        is_s.reltuples,
+        k.bs,
+        (k.bs * is_s.relpages)::bigint AS index_size_bytes,
+        CEIL(
+            (is_s.reltuples * (
+                CEIL((k.tpl_hdr + is_s.data_width)::numeric / k.ma) * k.ma + 4
+            )) / NULLIF((k.bs - k.page_hdr) * 0.70, 0)
+        )::bigint AS expected_pages
+    FROM index_stats is_s
+    CROSS JOIN constants k
+)
+SELECT
+    schema_name,
+    table_name,
+    index_name,
+    index_size_bytes,
+    (expected_pages * bs)::bigint AS expected_size_bytes,
+    GREATEST(0, (index_size_bytes - (expected_pages * bs)::bigint)) AS bloat_bytes,
+    ROUND(
+        (
+            GREATEST(0, (index_size_bytes - (expected_pages * bs)::bigint))::numeric
+            / NULLIF(index_size_bytes, 0)
+            * 100
+        )::numeric,
+        2
+    )::float AS bloat_ratio_pct
+FROM index_est
+ORDER BY bloat_bytes DESC;
+"""
+
+SQL_INDEX_BLOAT_ASYNCPG = """
+WITH constants AS (
+    SELECT
+        current_setting('block_size')::numeric AS bs,
+        40 AS page_hdr,
+        8 AS tpl_hdr,
+        8 AS ma
+),
+index_stats AS (
+    SELECT
+        n.nspname AS schema_name,
+        c.relname AS table_name,
+        i.relname AS index_name,
+        i.relpages,
+        i.reltuples,
+        COALESCE(
+            SUM(
+                (1.0 - COALESCE(s.null_frac, 0.0)) * COALESCE(s.avg_width, 8)
+            ),
+            16
+        ) AS data_width
+    FROM pg_class i
+    JOIN pg_index x ON x.indexrelid = i.oid
+    JOIN pg_class c ON c.oid = x.indrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_am am ON am.oid = i.relam AND am.amname = 'btree'
+    LEFT JOIN pg_stats s ON s.schemaname = n.nspname
+                        AND s.tablename = c.relname
+                        AND s.attname = ANY(
+                            SELECT a.attname
+                            FROM pg_attribute a
+                            WHERE a.attrelid = c.oid
+                              AND a.attnum = ANY(string_to_array(x.indkey::text, ' ')::int[])
+                        )
+    WHERE n.nspname = ANY($1)
+      AND i.relpages > 0
+    GROUP BY n.nspname, c.relname, i.relname, i.relpages, i.reltuples
+),
+index_est AS (
+    SELECT
+        is_s.schema_name,
+        is_s.table_name,
+        is_s.index_name,
+        is_s.relpages,
+        is_s.reltuples,
+        k.bs,
+        (k.bs * is_s.relpages)::bigint AS index_size_bytes,
+        CEIL(
+            (is_s.reltuples * (
+                CEIL((k.tpl_hdr + is_s.data_width)::numeric / k.ma) * k.ma + 4
+            )) / NULLIF((k.bs - k.page_hdr) * 0.70, 0)
+        )::bigint AS expected_pages
+    FROM index_stats is_s
+    CROSS JOIN constants k
+)
+SELECT
+    schema_name,
+    table_name,
+    index_name,
+    index_size_bytes,
+    (expected_pages * bs)::bigint AS expected_size_bytes,
+    GREATEST(0, (index_size_bytes - (expected_pages * bs)::bigint)) AS bloat_bytes,
+    ROUND(
+        (
+            GREATEST(0, (index_size_bytes - (expected_pages * bs)::bigint))::numeric
+            / NULLIF(index_size_bytes, 0)
+            * 100
+        )::numeric,
+        2
+    )::float AS bloat_ratio_pct
+FROM index_est
+ORDER BY bloat_bytes DESC;
+"""
