@@ -12,6 +12,7 @@ import os
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 from urllib.parse import quote_plus, urlsplit
@@ -27,11 +28,14 @@ except ImportError:  # pragma: no cover
     HAS_PSYCOPG2 = False
 
 
-ALL_CHECKS = ["redundant", "hot", "low-usage"]
+ALL_CHECKS = ["redundant", "hot", "low-usage", "invalid", "unindexed-fks", "dead-tuples"]
 CHECK_FIELDS: dict[str, str] = {
-    "redundant": "redundant_indexes",
-    "hot": "hot_issues",
-    "low-usage": "low_usage_indexes",
+    "redundant":     "redundant_indexes",
+    "hot":           "hot_issues",
+    "low-usage":     "low_usage_indexes",
+    "invalid":       "invalid_indexes",
+    "unindexed-fks": "unindexed_fks",
+    "dead-tuples":   "autovacuum_dead_tuples",
 }
 DEFAULT_CONNECT_TIMEOUT = 10
 
@@ -71,10 +75,42 @@ class LowUsageIndexIssue:
 
 
 @dataclass(frozen=True)
+class InvalidIndexIssue:
+    child_table: str
+    invalid_index: str
+    index_size: str
+
+
+@dataclass(frozen=True)
+class UnindexedFKIssue:
+    child_table: str
+    fk_name: str
+    parent_table: str
+    fk_definition: str
+
+
+@dataclass(frozen=True)
+class DeadTuplesIssue:
+    table_name: str
+    dead_tuples: int
+    live_tuples: int
+    dead_tuple_pct: float
+    last_autovacuum: datetime | None = None
+    last_vacuum: datetime | None = None
+
+
+@dataclass(frozen=True)
 class DatabaseHealthReport:
     hot_issues: list[HotUpdateIssue] = field(default_factory=list)
     redundant_indexes: list[RedundantIndexIssue] = field(default_factory=list)
     low_usage_indexes: list[LowUsageIndexIssue] = field(default_factory=list)
+    invalid_indexes: list[InvalidIndexIssue] = field(default_factory=list)
+    unindexed_fks: list[UnindexedFKIssue] = field(default_factory=list)
+    autovacuum_dead_tuples: list[DeadTuplesIssue] = field(default_factory=list)
+
+    @property
+    def has_critical_issues(self) -> bool:
+        return bool(self.invalid_indexes or self.unindexed_fks or self.autovacuum_dead_tuples)
 
 
 class DatabaseConnectionError(Exception):
@@ -113,6 +149,9 @@ class PostgresHealthAuditor:
                 hot_issues: list[HotUpdateIssue] = []
                 redundant_indexes: list[RedundantIndexIssue] = []
                 low_usage: list[LowUsageIndexIssue] = []
+                invalid_indexes: list[InvalidIndexIssue] = []
+                unindexed_fks: list[UnindexedFKIssue] = []
+                autovacuum_dead_tuples: list[DeadTuplesIssue] = []
 
                 if "hot" in selected:
                     hot_issues = self._audit_hot_and_fillfactor(
@@ -124,11 +163,20 @@ class PostgresHealthAuditor:
                     low_usage = self._audit_low_usage_indexes(
                         cur, max_rw_ratio, schemas, min_size_bytes, min_table_rows
                     )
+                if "invalid" in selected:
+                    invalid_indexes = self._audit_invalid_indexes(cur, schemas)
+                if "unindexed-fks" in selected:
+                    unindexed_fks = self._audit_unindexed_fks(cur, schemas)
+                if "dead-tuples" in selected:
+                    autovacuum_dead_tuples = self._audit_autovacuum_dead_tuples(cur, schemas)
 
                 return DatabaseHealthReport(
                     hot_issues=hot_issues,
                     redundant_indexes=redundant_indexes,
                     low_usage_indexes=low_usage,
+                    invalid_indexes=invalid_indexes,
+                    unindexed_fks=unindexed_fks,
+                    autovacuum_dead_tuples=autovacuum_dead_tuples,
                 )
         finally:
             conn.close()
@@ -146,13 +194,14 @@ class PostgresHealthAuditor:
             t.relname AS table_name,
             t.n_tup_upd AS total_updates,
             t.n_tup_hot_upd AS hot_updates,
-            ROUND((t.n_tup_hot_upd::numeric / NULLIF(t.n_tup_upd, 0)) * 100, 2) AS hot_ratio_pct,
+            ROUND(
+                (t.n_tup_hot_upd::numeric / NULLIF(t.n_tup_upd, 0)) * 100, 2
+            )::float AS hot_ratio_pct,
             COALESCE(
                 (
-                    SELECT split_part(opt, '=', 2)::int
-                    FROM unnest(c.reloptions) AS opt
-                    WHERE substr(opt, 1, 11) = 'fillfactor='
-                    LIMIT 1
+                    SELECT option_value::int
+                    FROM pg_options_to_table(c.reloptions)
+                    WHERE option_name = 'fillfactor'
                 ), 100
             ) AS fillfactor,
             t.n_live_tup AS table_rows,
@@ -181,7 +230,8 @@ class PostgresHealthAuditor:
     def _audit_redundant_indexes(
         self, cur: Any, schemas: list[str] | None, min_size_bytes: int
     ) -> list[RedundantIndexIssue]:
-        # Detects exact duplicate indexes and left-prefix redundant indexes using CTE
+        # Detects exact duplicate indexes and left-prefix redundant indexes using CTE.
+        # Restricted to btree indexes that are currently valid (indisvalid = true).
         query = """
         WITH parsed_indexes AS (
             SELECT
@@ -193,6 +243,10 @@ class PostgresHealthAuditor:
                 string_to_array(i.indkey::text, ' ') AS keys,
                 pg_relation_size(i.indexrelid) AS size_bytes
             FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid
+            JOIN pg_am am ON am.oid = c.relam
+            WHERE am.amname = 'btree'
+              AND i.indisvalid
         )
         SELECT
             c.relname AS table_name,
@@ -254,7 +308,7 @@ class PostgresHealthAuditor:
         JOIN pg_index idx ON idx.indexrelid = i.indexrelid
         JOIN pg_class c ON c.oid = i.relid
         JOIN pg_namespace ns ON ns.oid = c.relnamespace
-        WHERE (t.n_tup_ins + t.n_tup_upd + t.n_tup_del) > 100
+        WHERE (t.n_tup_ins + t.n_tup_upd + t.n_tup_del) > 1000
           AND NOT idx.indisprimary
           AND NOT idx.indisunique
           AND (i.idx_scan::numeric / NULLIF(t.n_tup_ins + t.n_tup_upd + t.n_tup_del, 0)) < %s
@@ -273,6 +327,136 @@ class PostgresHealthAuditor:
             data: dict[str, Any] = dict(r)
             issues.append(LowUsageIndexIssue(**data))
         return issues
+
+    def _audit_invalid_indexes(
+        self, cur: Any, schemas: list[str] | None
+    ) -> list[InvalidIndexIssue]:
+        """Returns indexes with indisvalid = FALSE — these need immediate attention."""
+        if schemas:
+            query = """
+            SELECT
+                c.relname AS child_table,
+                idx.relname AS invalid_index,
+                pg_size_pretty(pg_relation_size(i.indexrelid)) AS index_size
+            FROM pg_index i
+            JOIN pg_class idx ON idx.oid = i.indexrelid
+            JOIN pg_class c ON c.oid = i.indrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE i.indisvalid = FALSE
+              AND n.nspname = ANY(%s)
+            ORDER BY pg_relation_size(i.indexrelid) DESC;
+            """
+            cur.execute(query, [schemas])
+        else:
+            query = """
+            SELECT
+                c.relname AS child_table,
+                idx.relname AS invalid_index,
+                pg_size_pretty(pg_relation_size(i.indexrelid)) AS index_size
+            FROM pg_index i
+            JOIN pg_class idx ON idx.oid = i.indexrelid
+            JOIN pg_class c ON c.oid = i.indrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE i.indisvalid = FALSE
+              AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
+            ORDER BY pg_relation_size(i.indexrelid) DESC;
+            """
+            cur.execute(query)
+        rows = cur.fetchall()
+        return [InvalidIndexIssue(**dict(r)) for r in rows]
+
+    def _audit_unindexed_fks(
+        self, cur: Any, schemas: list[str] | None
+    ) -> list[UnindexedFKIssue]:
+        """Returns foreign keys that lack a supporting index on the referencing column(s)."""
+        if schemas:
+            query = """
+            SELECT
+                c.conrelid::regclass::text AS child_table,
+                c.conname AS fk_name,
+                c.confrelid::regclass::text AS parent_table,
+                pg_get_constraintdef(c.oid) AS fk_definition
+            FROM pg_constraint c
+            JOIN pg_namespace n ON n.oid = c.connamespace
+            WHERE c.contype = 'f'
+              AND n.nspname = ANY(%s)
+              AND NOT EXISTS (
+                SELECT 1
+                FROM pg_index i
+                WHERE i.indrelid = c.conrelid
+                  AND (string_to_array(i.indkey::text, ' '))[1:cardinality(c.conkey)] =
+                      string_to_array(array_to_string(c.conkey, ' '), ' ')
+                  AND i.indisvalid
+              )
+            ORDER BY c.conrelid::regclass::text, c.conname;
+            """
+            cur.execute(query, [schemas])
+        else:
+            query = """
+            SELECT
+                c.conrelid::regclass::text AS child_table,
+                c.conname AS fk_name,
+                c.confrelid::regclass::text AS parent_table,
+                pg_get_constraintdef(c.oid) AS fk_definition
+            FROM pg_constraint c
+            JOIN pg_namespace n ON n.oid = c.connamespace
+            WHERE c.contype = 'f'
+              AND n.nspname NOT IN ('pg_catalog', 'pg_toast')
+              AND NOT EXISTS (
+                SELECT 1
+                FROM pg_index i
+                WHERE i.indrelid = c.conrelid
+                  AND (string_to_array(i.indkey::text, ' '))[1:cardinality(c.conkey)] =
+                      string_to_array(array_to_string(c.conkey, ' '), ' ')
+                  AND i.indisvalid
+              )
+            ORDER BY c.conrelid::regclass::text, c.conname;
+            """
+            cur.execute(query)
+        rows = cur.fetchall()
+        return [UnindexedFKIssue(**dict(r)) for r in rows]
+
+    def _audit_autovacuum_dead_tuples(
+        self, cur: Any, schemas: list[str] | None
+    ) -> list[DeadTuplesIssue]:
+        """Returns tables with high dead-tuple ratios indicating autovacuum lag."""
+        if schemas:
+            query = """
+            SELECT
+                st.relname AS table_name,
+                st.n_dead_tup AS dead_tuples,
+                st.n_live_tup AS live_tuples,
+                ROUND(
+                    (st.n_dead_tup::numeric / NULLIF(st.n_live_tup + st.n_dead_tup, 0)) * 100, 2
+                )::float AS dead_tuple_pct,
+                st.last_autovacuum,
+                st.last_vacuum
+            FROM pg_stat_user_tables st
+            WHERE st.schemaname = ANY(%s)
+              AND st.n_dead_tup > 10000
+              AND (st.n_dead_tup::numeric / NULLIF(st.n_live_tup + st.n_dead_tup, 0)) > 0.15
+            ORDER BY st.n_dead_tup DESC;
+            """
+            cur.execute(query, [schemas])
+        else:
+            query = """
+            SELECT
+                st.relname AS table_name,
+                st.n_dead_tup AS dead_tuples,
+                st.n_live_tup AS live_tuples,
+                ROUND(
+                    (st.n_dead_tup::numeric / NULLIF(st.n_live_tup + st.n_dead_tup, 0)) * 100, 2
+                )::float AS dead_tuple_pct,
+                st.last_autovacuum,
+                st.last_vacuum
+            FROM pg_stat_user_tables st
+            WHERE st.n_dead_tup > 10000
+              AND (st.n_dead_tup::numeric / NULLIF(st.n_live_tup + st.n_dead_tup, 0)) > 0.15
+            ORDER BY st.n_dead_tup DESC;
+            """
+            cur.execute(query)
+        rows = cur.fetchall()
+        return [DeadTuplesIssue(**dict(r)) for r in rows]
 
 
 def render_text(report: DatabaseHealthReport) -> str:
@@ -618,6 +802,8 @@ def main(
     else:
         print_report(report)
 
+    if report.has_critical_issues:
+        return 3
     return 2 if has_issues(report) else 0
 
 

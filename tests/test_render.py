@@ -106,3 +106,31 @@ def test_has_issues():
     assert audit_pg.has_issues(DatabaseHealthReport()) is False
     issue = HotUpdateIssue("t", 1, 1, 100.0, 100, False, 50000, "12 MB")
     assert audit_pg.has_issues(DatabaseHealthReport(hot_issues=[issue])) is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: hot_ratio_pct field-type contract (task 1.7)
+# After QC-04 fix the DB emits ::float directly, so the field must accept
+# a plain Python float without going through _jsonable().
+# ---------------------------------------------------------------------------
+
+
+def test_hot_ratio_pct_accepts_native_float():
+    """1.7: HotUpdateIssue.hot_ratio_pct must be stored and returned as float."""
+    issue = HotUpdateIssue(
+        table_name="orders",
+        total_updates=200,
+        hot_updates=100,
+        hot_ratio_pct=50.0,       # native float — no Decimal wrapper
+        fillfactor=100,
+        fillfactor_warning=True,
+        table_rows=50000,
+        table_size="12 MB",
+    )
+    assert isinstance(issue.hot_ratio_pct, float)
+    assert issue.hot_ratio_pct == 50.0
+    # Confirm it round-trips through render_json without _jsonable() assistance
+    report = audit_pg.DatabaseHealthReport(hot_issues=[issue])
+    data = audit_pg.render_json(report, database="h", checks=["hot"])
+    assert data["issues"]["hot"][0]["hot_ratio_pct"] == 50.0
+    assert isinstance(data["issues"]["hot"][0]["hot_ratio_pct"], float)

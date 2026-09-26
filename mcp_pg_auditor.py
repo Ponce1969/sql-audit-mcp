@@ -13,7 +13,6 @@ import sys
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Any
 
 import asyncpg
 from dotenv import find_dotenv, load_dotenv
@@ -220,7 +219,9 @@ class AsyncPostgresHealthAuditor:
             st.relname AS table_name,
             st.n_dead_tup AS dead_tuples,
             st.n_live_tup AS live_tuples,
-            ROUND((st.n_dead_tup::numeric / NULLIF(st.n_live_tup + st.n_dead_tup, 0)) * 100, 2)::float AS dead_tuple_pct,
+            ROUND(
+                (st.n_dead_tup::numeric / NULLIF(st.n_live_tup + st.n_dead_tup, 0)) * 100, 2
+            )::float AS dead_tuple_pct,
             st.last_autovacuum,
             st.last_vacuum
         FROM pg_stat_user_tables st
@@ -245,7 +246,9 @@ class AsyncPostgresHealthAuditor:
             t.relname AS table_name,
             t.n_tup_upd AS total_updates,
             t.n_tup_hot_upd AS hot_updates,
-            ROUND((t.n_tup_hot_upd::numeric / NULLIF(t.n_tup_upd, 0)) * 100, 2)::float AS hot_ratio_pct,
+            ROUND(
+                (t.n_tup_hot_upd::numeric / NULLIF(t.n_tup_upd, 0)) * 100, 2
+            )::float AS hot_ratio_pct,
             COALESCE(
                 (
                     SELECT option_value::int
@@ -390,15 +393,17 @@ def resolve_dsn(db_alias: str) -> str:
     ),
 )
 async def pg_health_audit(
-    schemas: list[str] = ["public"],
+    schemas: list[str] | None = None,
     enabled_checks: list[CheckName] | None = None,
     min_table_rows: int = 1000,
     min_size_bytes: int = 10_000_000,
     db_alias: str = "default",
+    connect_timeout: int | None = None,
 ) -> PostgresHealthReport:
     """Deterministic MCP tool with flat parameters and environment-backed DSN resolution."""
     start_time = time.perf_counter()
     dsn = resolve_dsn(db_alias)
+    effective_schemas = schemas if schemas is not None else ["public"]
 
     checks_to_run = (
         [c.value for c in enabled_checks]
@@ -406,9 +411,12 @@ async def pg_health_audit(
         else [c.value for c in CheckName]
     )
 
-    executor = AsyncPostgresHealthAuditor(dsn=dsn)
+    executor = AsyncPostgresHealthAuditor(
+        dsn=dsn,
+        connect_timeout=connect_timeout if connect_timeout is not None else 10,
+    )
     report = await executor.run_full_audit(
-        schemas=schemas,
+        schemas=effective_schemas,
         checks=checks_to_run,
         min_table_rows=min_table_rows,
         min_size_bytes=min_size_bytes,
@@ -450,18 +458,25 @@ async def _run_cli_main() -> None:
         help="Min index size in bytes (default: 10MB)",
     )
     parser.add_argument(
+        "--timeout",
+        type=int,
+        default=10,
+        help="Connection timeout in seconds (default: 10)",
+    )
+    parser.add_argument(
         "--json", action="store_true", help="Output full report as formatted JSON"
     )
 
     raw_args = [a for a in sys.argv[1:] if a not in ("--cli", "-c")]
     args = parser.parse_args(raw_args)
 
-    dsn = args.dsn or os.getenv("DATABASE_URL")
+    from audit_pg import resolve_db_url  # local import avoids circular import at module load
+    dsn = resolve_db_url(cli_url=args.dsn)
     if not dsn:
         dsn = resolve_dsn(args.alias)
 
     schemas = [s.strip() for s in args.schemas.split(",") if s.strip()]
-    auditor = AsyncPostgresHealthAuditor(dsn=dsn)
+    auditor = AsyncPostgresHealthAuditor(dsn=dsn, connect_timeout=args.timeout)
 
     start_time = time.perf_counter()
     report = await auditor.run_full_audit(
@@ -481,52 +496,67 @@ async def _run_cli_main() -> None:
 
 
 def _print_cli_summary(report: PostgresHealthReport) -> None:
-    print(f"\n=======================================================")
+    print("\n=======================================================")
     print(f" PostgreSQL Health Audit Report ({report.database_alias})")
     print(
-        f" Execution time: {report.execution_time_ms} ms | Schemas: {', '.join(report.schemas_audited)}"
+        f" Execution time: {report.execution_time_ms} ms | "
+        f"Schemas: {', '.join(report.schemas_audited)}"
     )
     print(f" Critical issues detected: {'YES' if report.has_critical_issues else 'NO'}")
-    print(f"=======================================================\n")
+    print("=======================================================\n")
 
     print(f"[1] Invalid Indexes (indisvalid = false): {len(report.invalid_indexes)}")
-    for item in report.invalid_indexes:
+    for inv in report.invalid_indexes:
         print(
-            f"    - Table: {item.child_table} | Index: {item.invalid_index} (Size: {item.index_size})"
+            f"    - Table: {inv.child_table} | "
+            f"Index: {inv.invalid_index} (Size: {inv.index_size})"
         )
 
     print(f"[2] Unindexed Foreign Keys: {len(report.unindexed_fks)}")
-    for item in report.unindexed_fks:
-        print(f"    - FK: {item.fk_name} on {item.child_table} -> {item.parent_table}")
-        print(f"      Def: {item.fk_definition}")
+    for fk in report.unindexed_fks:
+        print(f"    - FK: {fk.fk_name} on {fk.child_table} -> {fk.parent_table}")
+        print(f"      Def: {fk.fk_definition}")
 
     print(f"[3] Autovacuum & Dead Tuples Lag: {len(report.autovacuum_dead_tuples)}")
-    for item in report.autovacuum_dead_tuples:
+    for dt in report.autovacuum_dead_tuples:
         print(
-            f"    - Table: {item.table_name} | Dead tuples: {item.dead_tuples:,} ({item.dead_tuple_pct}%) | Live: {item.live_tuples:,}"
+            f"    - Table: {dt.table_name} | "
+            f"Dead tuples: {dt.dead_tuples:,} ({dt.dead_tuple_pct}%) | Live: {dt.live_tuples:,}"
         )
 
     print(
         f"[4] Broken HOT Updates / Fillfactor Issues: {len(report.hot_fillfactor_issues)}"
     )
-    for item in report.hot_fillfactor_issues:
+    for hot in report.hot_fillfactor_issues:
         print(
-            f"    - Table: {item.table_name} | HOT ratio: {item.hot_ratio_pct}% ({item.hot_updates}/{item.total_updates}) | Fillfactor: {item.fillfactor}"
+            f"    - Table: {hot.table_name} | "
+            f"HOT ratio: {hot.hot_ratio_pct}% ({hot.hot_updates}/{hot.total_updates}) | "
+            f"Fillfactor: {hot.fillfactor}"
         )
 
     print(f"[5] Redundant / Duplicate Indexes: {len(report.redundant_indexes)}")
-    for item in report.redundant_indexes:
+    for red in report.redundant_indexes:
         print(
-            f"    - Table: {item.table_name} | Redundant: {item.redundant_index} ({item.redundant_size}) covered by {item.covering_index}"
+            f"    - Table: {red.table_name} | "
+            f"Redundant: {red.redundant_index} ({red.redundant_size}) | "
+            f"Covered by: {red.covering_index}"
         )
 
     print(f"[6] Low Usage / Unprofitable Indexes: {len(report.low_usage_indexes)}")
-    for item in report.low_usage_indexes:
+    for low in report.low_usage_indexes:
         print(
-            f"    - Table: {item.table_name} | Index: {item.index_name} ({item.size}) | Scans: {item.index_scans} vs Writes: {item.table_writes} (Ratio: {item.read_write_ratio})"
+            f"    - Table: {low.table_name} | Index: {low.index_name} ({low.size}) | "
+            f"Scans: {low.index_scans} vs Writes: {low.table_writes} | "
+            f"Ratio: {low.read_write_ratio}"
         )
 
     print("\nAudit completed.\n")
+
+
+def run_mcp_cli() -> None:
+    """Sync entry point for [project.scripts] — asyncio wrapper for _run_cli_main."""
+    import asyncio
+    asyncio.run(_run_cli_main())
 
 
 if __name__ == "__main__":

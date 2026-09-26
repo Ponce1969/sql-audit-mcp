@@ -11,6 +11,14 @@ dependencies = [
 
 [project.scripts]
 sql-audit = "audit_pg:main"
+sql-audit-mcp = "mcp_pg_auditor:run_mcp_cli"
+
+[project.optional-dependencies]
+mcp = [
+    "asyncpg>=0.29.0",
+    "mcp>=1.0.0,<2",
+    "pydantic>=2.0.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -24,11 +32,19 @@ package = true
 
 [dependency-groups]
 dev = [
+    "asyncpg>=0.29.0",
+    "fastmcp>=2.0.0",
+    "mcp>=1.0.0,<2",
     "mypy>=2.3.1",
+    "pydantic>=2.0.0",
     "pytest>=8.0",
+    "pytest-asyncio>=0.23.0",
     "ruff>=0.16.8",
     "types-psycopg2>=2.9.21.20260911",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
@@ -39,6 +55,13 @@ select = ["E", "F", "W", "I", "UP", "B", "C4"]
 
 [tool.mypy]
 python_version = "3.10"
+files = ["audit_pg.py", "mcp_pg_auditor.py"]
 strict = true
 warn_return_any = true
 warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["asyncpg"]
+ignore_missing_imports = true
+
+
