@@ -14,7 +14,6 @@ from pydantic import JsonValue
 
 def compute_stable_finding_id(
     check_code: str,
-    object_type: str,
     object_name: str,
     sub_object: str | None = None,
 ) -> str:

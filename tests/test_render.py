@@ -27,7 +27,9 @@ def test_render_text_with_issues():
     text = audit_pg.render_text(report)
     assert "* Table: orders" in text
     assert "WARNING: Default 100% fillfactor prevents HOT" in text
-    assert "ALTER TABLE orders SET (fillfactor = 85)" in text
+    assert "Considerations:" in text
+    assert "ALTER TABLE" not in text
+    assert "VACUUM FULL" not in text
     assert "Rows: 50000" in text
     assert "Table size: 12 MB" in text
 

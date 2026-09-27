@@ -27,10 +27,10 @@ def compare_audit_reports(
             new_findings.append(curr_f)
         else:
             prev_f = prev_map[fid]
-            prev_eid = prev_f.evidence[0].evidence_id if prev_f.evidence else ""
-            curr_eid = curr_f.evidence[0].evidence_id if curr_f.evidence else ""
+            prev_eids = sorted(e.evidence_id for e in prev_f.evidence)
+            curr_eids = sorted(e.evidence_id for e in curr_f.evidence)
 
-            if prev_eid == curr_eid:
+            if prev_eids == curr_eids:
                 unchanged_findings.append(curr_f)
             else:
                 changed_findings.append(
@@ -38,8 +38,8 @@ def compare_audit_reports(
                         finding_id=fid,
                         check=curr_f.check,
                         object_name=curr_f.object_name,
-                        previous_evidence_id=prev_eid,
-                        current_evidence_id=curr_eid,
+                        previous_evidence_ids=prev_eids,
+                        current_evidence_ids=curr_eids,
                         current_finding=curr_f,
                     )
                 )
@@ -67,6 +67,7 @@ def compare_audit_reports(
         resolved_findings=resolved_findings,
         unchanged_findings=unchanged_findings,
         changed_findings=changed_findings,
+        is_partial=bool(previous.is_partial or current.is_partial),
     )
 
 
@@ -95,8 +96,10 @@ def render_diff_text(diff: AuditDiff) -> str:
         lines.append("\n[~] PERSISTING FINDINGS WITH CHANGED EVIDENCE:")
         for cf in diff.changed_findings:
             lines.append(f"  ~ {cf.check}: {cf.object_name}")
-            lines.append(f"      prev: {cf.previous_evidence_id}")
-            lines.append(f"      curr: {cf.current_evidence_id}")
+            prev_str = ", ".join(cf.previous_evidence_ids) if cf.previous_evidence_ids else "(none)"
+            curr_str = ", ".join(cf.current_evidence_ids) if cf.current_evidence_ids else "(none)"
+            lines.append(f"      prev: {prev_str}")
+            lines.append(f"      curr: {curr_str}")
 
     if diff.unchanged_findings:
         lines.append(

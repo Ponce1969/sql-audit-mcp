@@ -120,7 +120,7 @@ def bloat_report_to_findings(report: BloatReport, server_version: str = "16.0") 
             evidence_id=eid,
         )
         finding_id = compute_stable_finding_id(
-            "PG-BLOAT-TABLE", "table", f"{t.schema_name}.{t.table_name}"
+            "PG-BLOAT-TABLE", f"{t.schema_name}.{t.table_name}"
         )
         reason = (
             f"Table {t.schema_name}.{t.table_name} has estimated {t.bloat_ratio_pct:.1f}% bloat "
@@ -168,7 +168,7 @@ def bloat_report_to_findings(report: BloatReport, server_version: str = "16.0") 
             evidence_id=eid,
         )
         finding_id = compute_stable_finding_id(
-            "PG-BLOAT-INDEX", "index", f"{i.schema_name}.{i.index_name}"
+            "PG-BLOAT-INDEX", f"{i.schema_name}.{i.index_name}"
         )
         reason = (
             f"B-tree index {i.schema_name}.{i.index_name} on {i.table_name} has estimated "

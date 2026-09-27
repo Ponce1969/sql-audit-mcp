@@ -21,23 +21,43 @@ def _traverse_blocking_tree(
     all_blocked: list[int],
     tree_lines: list[str],
     indent: str = "  ",
+    active_path: set[int] | None = None,
 ) -> float:
-    """Recursively formats child blocked processes and returns max wait duration."""
+    """Recursively formats child blocked processes and returns max wait duration.
+
+    Detects back-edges using active_path (call stack ancestors) to guarantee cycle termination
+    while preserving legitimate multi-parent convergent DAG paths.
+    """
+    if active_path is None:
+        active_path = {parent_pid}
+
     max_duration = 0.0
     children = blocking_to_blocked.get(parent_pid, [])
     for child_pid in children:
         all_blocked.append(child_pid)
-        child_proc = processes_by_pid[child_pid]
-        if child_proc.duration_sec > max_duration:
-            max_duration = child_proc.duration_sec
+        child_proc = processes_by_pid.get(child_pid)
+        duration_sec = child_proc.duration_sec if child_proc else 0.0
+        if duration_sec > max_duration:
+            max_duration = duration_sec
 
-        wait_desc = f"{child_proc.wait_event_type}:{child_proc.wait_event}".strip(":")
+        wait_desc = ""
+        if child_proc:
+            wait_desc = f"{child_proc.wait_event_type}:{child_proc.wait_event}".strip(":")
         wait_label = wait_desc or "lock"
+
+        if child_pid in active_path:
+            tree_lines.append(
+                f"{indent}↓ blocks PID {child_pid} "
+                f"(blocked {duration_sec:.1f}s, wait: {wait_label}) "
+                f"[cycle detected in observed blocking graph]"
+            )
+            continue
+
         tree_lines.append(
             f"{indent}↓ blocks PID {child_pid} "
-            f"(blocked {child_proc.duration_sec:.1f}s, wait: {wait_label})"
+            f"(blocked {duration_sec:.1f}s, wait: {wait_label})"
         )
-        if child_proc.query:
+        if child_proc and child_proc.query:
             child_q = child_proc.query.replace("\n", " ").strip()[:80]
             tree_lines.append(f"{indent}  query: {child_q}")
 
@@ -48,6 +68,7 @@ def _traverse_blocking_tree(
             all_blocked=all_blocked,
             tree_lines=tree_lines,
             indent=indent + "    ",
+            active_path=active_path | {child_pid},
         )
         if child_max > max_duration:
             max_duration = child_max
@@ -148,12 +169,13 @@ def build_lock_contention_report(
             tree_lines=tree_lines,
         )
 
+        distinct_blocked = list(dict.fromkeys(all_blocked))
         trees.append(
             LockTree(
                 root_pid=root_pid,
                 root_process=root_proc,
-                total_blocked=len(all_blocked),
-                blocked_pids=all_blocked,
+                total_blocked=len(distinct_blocked),
+                blocked_pids=distinct_blocked,
                 max_blocked_duration_sec=max_duration,
                 chain_representation="\n".join(tree_lines),
             )
@@ -210,7 +232,7 @@ def lock_report_to_findings(
         )
 
         finding_id = compute_stable_finding_id(
-            "PG-LOCK-CONTENTION", "process", f"PID_{tree.root_pid}"
+            "PG-LOCK-CONTENTION", f"PID_{tree.root_pid}"
         )
         reason = (
             f"Process PID {tree.root_pid} ({root.state or 'active'}) is holding locks "

@@ -29,7 +29,15 @@ from sql_audit.application import (
     render_lock_report_text,
     render_plan_report_text,
 )
-from sql_audit.domain import BloatReport, LockContentionReport, PlanAnalysisReport
+from sql_audit.domain import (
+    DEFAULT_LOCK_TIMEOUT_MS,
+    DEFAULT_MIN_SIZE_BYTES,
+    DEFAULT_MIN_TABLE_ROWS,
+    DEFAULT_STATEMENT_TIMEOUT_MS,
+    BloatReport,
+    LockContentionReport,
+    PlanAnalysisReport,
+)
 from sql_audit.infrastructure.queries import (
     SQL_DEAD_TUPLES_ASYNCPG,
     SQL_HOT_ASYNCPG,
@@ -125,20 +133,41 @@ class PostgresHealthReport(BaseModel):
     hot_fillfactor_issues: list[HotUpdateIssue] = Field(default_factory=list)
     redundant_indexes: list[RedundantIndexIssue] = Field(default_factory=list)
     low_usage_indexes: list[LowUsageIndexIssue] = Field(default_factory=list)
+    checks_executed: list[str] = Field(default_factory=list)
+    checks_failed: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    is_partial: bool = False
+
+    @property
+    def is_healthy(self) -> bool:
+        has_any_finding = bool(
+            self.invalid_indexes
+            or self.unindexed_fks
+            or self.autovacuum_dead_tuples
+            or self.hot_fillfactor_issues
+            or self.redundant_indexes
+            or self.low_usage_indexes
+        )
+        return not self.is_partial and len(self.errors) == 0 and not has_any_finding
 
     def to_audit_report(
         self,
+        database: str | None = None,
         checks: list[str] | None = None,
         observed_at: datetime | None = None,
         server_version: str = "unknown",
-        min_size_bytes: int = 10_000_000,
-        min_table_rows: int = 1000,
+        min_size_bytes: int = DEFAULT_MIN_SIZE_BYTES,
+        min_table_rows: int = DEFAULT_MIN_TABLE_ROWS,
         audit_id: str | None = None,
     ) -> AuditReport:
+        effective_checks = (
+            checks
+            or (self.checks_executed if self.checks_executed else [c.value for c in CheckName])
+        )
         return convert_legacy_report_to_audit_report(
             report=self,
-            database=self.database_alias,
-            checks=checks or [c.value for c in CheckName],
+            database=database or self.database_alias,
+            checks=effective_checks,
             observed_at=observed_at,
             server_version=server_version,
             duration_ms=self.execution_time_ms,
@@ -155,19 +184,38 @@ class PostgresHealthReport(BaseModel):
 class AsyncPostgresHealthAuditor:
     """Performs deterministic catalog audits for PostgreSQL anti-patterns."""
 
-    def __init__(self, dsn: str, connect_timeout: int = 10):
+    def __init__(
+        self,
+        dsn: str,
+        connect_timeout: int = 10,
+        statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
+        lock_timeout_ms: int = DEFAULT_LOCK_TIMEOUT_MS,
+    ):
         self.dsn = dsn
         self.connect_timeout = connect_timeout
+        self.statement_timeout_ms = statement_timeout_ms
+        self.lock_timeout_ms = lock_timeout_ms
+
+    async def _connect(self) -> asyncpg.Connection:
+        server_settings = {
+            "statement_timeout": str(self.statement_timeout_ms),
+            "lock_timeout": str(self.lock_timeout_ms),
+        }
+        return await asyncpg.connect(
+            self.dsn,
+            timeout=self.connect_timeout,
+            server_settings=server_settings,
+        )
 
     async def run_full_audit(
         self,
         schemas: list[str],
         checks: list[str],
-        min_table_rows: int = 1000,
-        min_size_bytes: int = 10_000_000,
+        min_table_rows: int = DEFAULT_MIN_TABLE_ROWS,
+        min_size_bytes: int = DEFAULT_MIN_SIZE_BYTES,
         db_alias: str = "default",
     ) -> PostgresHealthReport:
-        conn = await asyncpg.connect(self.dsn, timeout=self.connect_timeout)
+        conn = await self._connect()
         try:
             invalid_indexes: list[InvalidIndexIssue] = []
             unindexed_fks: list[UnindexedFKIssue] = []
@@ -176,22 +224,62 @@ class AsyncPostgresHealthAuditor:
             redundant: list[RedundantIndexIssue] = []
             low_usage: list[LowUsageIndexIssue] = []
 
+            executed_checks: list[str] = []
+            failed_checks: list[str] = []
+            audit_errors: list[str] = []
+
             if CheckName.INVALID_INDEXES.value in checks:
-                invalid_indexes = await self._audit_invalid_indexes(conn, schemas)
+                try:
+                    invalid_indexes = await self._audit_invalid_indexes(conn, schemas)
+                    executed_checks.append(CheckName.INVALID_INDEXES.value)
+                except Exception as exc:  # noqa: BLE001
+                    failed_checks.append(CheckName.INVALID_INDEXES.value)
+                    audit_errors.append(f"{CheckName.INVALID_INDEXES.value}: {exc}")
+
             if CheckName.UNINDEXED_FKS.value in checks:
-                unindexed_fks = await self._audit_unindexed_fks(conn, schemas)
+                try:
+                    unindexed_fks = await self._audit_unindexed_fks(conn, schemas)
+                    executed_checks.append(CheckName.UNINDEXED_FKS.value)
+                except Exception as exc:  # noqa: BLE001
+                    failed_checks.append(CheckName.UNINDEXED_FKS.value)
+                    audit_errors.append(f"{CheckName.UNINDEXED_FKS.value}: {exc}")
+
             if CheckName.AUTOVACUUM_DEAD_TUPLES.value in checks:
-                dead_tuples = await self._audit_autovacuum_dead_tuples(conn, schemas)
+                try:
+                    dead_tuples = await self._audit_autovacuum_dead_tuples(conn, schemas)
+                    executed_checks.append(CheckName.AUTOVACUUM_DEAD_TUPLES.value)
+                except Exception as exc:  # noqa: BLE001
+                    failed_checks.append(CheckName.AUTOVACUUM_DEAD_TUPLES.value)
+                    audit_errors.append(f"{CheckName.AUTOVACUUM_DEAD_TUPLES.value}: {exc}")
+
             if CheckName.HOT_FILLFACTOR.value in checks:
-                hot_issues = await self._audit_hot_and_fillfactor(conn, schemas, min_table_rows)
+                try:
+                    hot_issues = await self._audit_hot_and_fillfactor(conn, schemas, min_table_rows)
+                    executed_checks.append(CheckName.HOT_FILLFACTOR.value)
+                except Exception as exc:  # noqa: BLE001
+                    failed_checks.append(CheckName.HOT_FILLFACTOR.value)
+                    audit_errors.append(f"{CheckName.HOT_FILLFACTOR.value}: {exc}")
+
             if CheckName.REDUNDANT_INDEXES.value in checks:
-                redundant = await self._audit_redundant_indexes(conn, schemas, min_size_bytes)
+                try:
+                    redundant = await self._audit_redundant_indexes(conn, schemas, min_size_bytes)
+                    executed_checks.append(CheckName.REDUNDANT_INDEXES.value)
+                except Exception as exc:  # noqa: BLE001
+                    failed_checks.append(CheckName.REDUNDANT_INDEXES.value)
+                    audit_errors.append(f"{CheckName.REDUNDANT_INDEXES.value}: {exc}")
+
             if CheckName.LOW_USAGE_INDEXES.value in checks:
-                low_usage = await self._audit_low_usage_indexes(
-                    conn, schemas, min_size_bytes, min_table_rows
-                )
+                try:
+                    low_usage = await self._audit_low_usage_indexes(
+                        conn, schemas, min_size_bytes, min_table_rows
+                    )
+                    executed_checks.append(CheckName.LOW_USAGE_INDEXES.value)
+                except Exception as exc:  # noqa: BLE001
+                    failed_checks.append(CheckName.LOW_USAGE_INDEXES.value)
+                    audit_errors.append(f"{CheckName.LOW_USAGE_INDEXES.value}: {exc}")
 
             has_critical = bool(invalid_indexes or unindexed_fks or dead_tuples)
+            is_partial = bool(failed_checks or audit_errors)
 
             return PostgresHealthReport(
                 database_alias=db_alias,
@@ -203,13 +291,17 @@ class AsyncPostgresHealthAuditor:
                 hot_fillfactor_issues=hot_issues,
                 redundant_indexes=redundant,
                 low_usage_indexes=low_usage,
+                checks_executed=executed_checks,
+                checks_failed=failed_checks,
+                errors=audit_errors,
+                is_partial=is_partial,
             )
         finally:
             await conn.close()
 
     async def audit_locks(self) -> LockContentionReport:
         """Inspects active lock contention and reconstructs blocking trees."""
-        conn = await asyncpg.connect(self.dsn, timeout=self.connect_timeout)
+        conn = await self._connect()
         try:
             records = await conn.fetch(SQL_LOCK_CONTENTION)
             rows = [dict(r) for r in records]
@@ -226,7 +318,7 @@ class AsyncPostgresHealthAuditor:
     ) -> BloatReport:
         """Estimates physical bloat for tables and B-tree indexes from catalog statistics."""
         effective_schemas = schemas if schemas is not None else ["public"]
-        conn = await asyncpg.connect(self.dsn, timeout=self.connect_timeout)
+        conn = await self._connect()
         try:
             tbl_records = await conn.fetch(SQL_TABLE_BLOAT_ASYNCPG, effective_schemas)
             idx_records = await conn.fetch(SQL_INDEX_BLOAT_ASYNCPG, effective_schemas)
@@ -245,26 +337,15 @@ class AsyncPostgresHealthAuditor:
     async def explain_query(
         self,
         query: str,
-        analyze: bool = False,
         db_alias: str = "default",
     ) -> PlanAnalysisReport:
-        """Runs EXPLAIN (or safe transactional EXPLAIN ANALYZE) and audits the execution plan."""
+        """Runs static EXPLAIN and audits the estimated execution plan."""
         import json
 
-        conn = await asyncpg.connect(self.dsn, timeout=self.connect_timeout)
+        conn = await self._connect()
         try:
-            if analyze:
-                # Transactional rollback ensures safety against mutating DML
-                tx = conn.transaction()
-                await tx.start()
-                try:
-                    explain_sql = f"EXPLAIN (ANALYZE, BUFFERS, COSTS, VERBOSE, FORMAT JSON) {query}"
-                    raw = await conn.fetchval(explain_sql)
-                finally:
-                    await tx.rollback()
-            else:
-                explain_sql = f"EXPLAIN (BUFFERS, COSTS, VERBOSE, FORMAT JSON) {query}"
-                raw = await conn.fetchval(explain_sql)
+            explain_sql = f"EXPLAIN (COSTS, VERBOSE, FORMAT JSON) {query}"
+            raw = await conn.fetchval(explain_sql)
 
             plan_data = json.loads(raw) if isinstance(raw, str) else raw
             return analyze_execution_plan(
@@ -360,8 +441,8 @@ def resolve_dsn(db_alias: str) -> str:
 async def pg_health_audit(
     schemas: list[str] | None = None,
     enabled_checks: list[CheckName] | None = None,
-    min_table_rows: int = 1000,
-    min_size_bytes: int = 10_000_000,
+    min_table_rows: int = DEFAULT_MIN_TABLE_ROWS,
+    min_size_bytes: int = DEFAULT_MIN_SIZE_BYTES,
     db_alias: str = "default",
     connect_timeout: int | None = None,
 ) -> PostgresHealthReport:
@@ -445,25 +526,24 @@ async def pg_bloat(
 @mcp.tool(
     name="pg_explain",
     description=(
-        "Simulates or executes a SQL query using PostgreSQL EXPLAIN (or safe transactional "
-        "EXPLAIN ANALYZE with immediate rollback) and audits the plan for performance bottlenecks: "
+        "Simulates a SQL query using PostgreSQL EXPLAIN (read-only, estimated plan) "
+        "and audits the plan for performance bottlenecks: "
         "large sequential scans, work_mem disk spills, cardinality estimation skew, and "
-        "high buffer I/O."
+        "high estimated cost."
     ),
 )
 async def pg_explain(
     query: str,
-    analyze: bool = False,
     db_alias: str = "default",
     connect_timeout: int | None = None,
 ) -> PlanAnalysisReport:
-    """Simulates or audits a PostgreSQL execution plan."""
+    """Simulates and audits a PostgreSQL execution plan."""
     dsn = resolve_dsn(db_alias)
     auditor = AsyncPostgresHealthAuditor(
         dsn=dsn,
         connect_timeout=connect_timeout if connect_timeout is not None else 10,
     )
-    return await auditor.explain_query(query=query, analyze=analyze, db_alias=db_alias)
+    return await auditor.explain_query(query=query, db_alias=db_alias)
 
 
 async def _run_cli_main() -> None:
@@ -482,14 +562,14 @@ async def _run_cli_main() -> None:
     parser.add_argument(
         "--min-table-rows",
         type=int,
-        default=1000,
-        help="Min live rows in table to evaluate (default: 1000)",
+        default=DEFAULT_MIN_TABLE_ROWS,
+        help=f"Min live rows in table to evaluate (default: {DEFAULT_MIN_TABLE_ROWS})",
     )
     parser.add_argument(
         "--min-size-bytes",
         type=int,
-        default=10_000_000,
-        help="Min index size in bytes (default: 10MB)",
+        default=DEFAULT_MIN_SIZE_BYTES,
+        help=f"Min index size in bytes (default: {DEFAULT_MIN_SIZE_BYTES})",
     )
     parser.add_argument(
         "--timeout",
@@ -505,9 +585,6 @@ async def _run_cli_main() -> None:
         "--bloat", action="store_true", help="Estimate physical bloat in tables and indexes"
     )
     parser.add_argument("--explain", default=None, help="Query string to explain and audit")
-    parser.add_argument(
-        "--analyze", action="store_true", help="Execute query in rolled-back tx for runtime stats"
-    )
 
     raw_args = [a for a in sys.argv[1:] if a not in ("--cli", "-c")]
     args = parser.parse_args(raw_args)
@@ -544,7 +621,6 @@ async def _run_cli_main() -> None:
     if args.explain:
         plan_report = await auditor.explain_query(
             query=args.explain,
-            analyze=args.analyze,
             db_alias=args.alias,
         )
         if args.json:

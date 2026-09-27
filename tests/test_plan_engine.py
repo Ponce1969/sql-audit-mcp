@@ -203,3 +203,126 @@ async def test_mcp_pg_explain_tool(monkeypatch):
     assert result.query == "SELECT 1"
     assert result.summary.total_cost == 0.01
     assert len(result.summary.warnings) == 0
+
+
+def test_cli_rejects_analyze_flag():
+    """CLI argparse rejects --analyze flag under strictly passive contract."""
+    import pytest
+
+    parser = audit_pg.build_parser()
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["--explain", "SELECT 1", "--analyze"])
+    assert exc_info.value.code == 2
+
+
+def test_mcp_and_auditor_signatures_have_no_analyze_parameter():
+    """Verify that neither pg_explain nor explain_query accept an analyze parameter."""
+    import inspect
+
+    import mcp_pg_auditor
+
+    # MCP tool
+    tool_sig = inspect.signature(pg_explain)
+    assert "analyze" not in tool_sig.parameters, "pg_explain must not expose 'analyze' parameter"
+
+    # Sync auditor
+    sync_sig = inspect.signature(audit_pg.PostgresHealthAuditor.explain_query)
+    assert "analyze" not in sync_sig.parameters, (
+        "PostgresHealthAuditor.explain_query must not accept 'analyze' parameter"
+    )
+
+    # Async auditor
+    async_sig = inspect.signature(mcp_pg_auditor.AsyncPostgresHealthAuditor.explain_query)
+    assert "analyze" not in async_sig.parameters, (
+        "AsyncPostgresHealthAuditor.explain_query must not accept 'analyze' parameter"
+    )
+
+
+def test_sync_explain_query_uses_strictly_passive_sql(monkeypatch):
+    """Sync explain_query issues only static EXPLAIN without transaction or rollback."""
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = [
+        [
+            {
+                "Plan": {
+                    "Node Type": "Result",
+                    "Total Cost": 0.01,
+                    "Plan Rows": 1,
+                }
+            }
+        ]
+    ]
+
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    monkeypatch.setattr(audit_pg.psycopg2, "connect", MagicMock(return_value=mock_conn))
+    monkeypatch.setattr(audit_pg, "HAS_PSYCOPG2", True)
+
+    auditor = audit_pg.PostgresHealthAuditor(db_url="postgresql://u:p@localhost:5432/db")
+    auditor.explain_query(query="SELECT 1")
+
+    # Verify executed SQL commands
+    executed_statements = [call.args[0] for call in mock_cursor.execute.call_args_list]
+    for stmt in executed_statements:
+        assert "ANALYZE" not in stmt, f"ANALYZE must not be executed: {stmt}"
+        assert "BEGIN" not in stmt, f"Explicit BEGIN must not be executed: {stmt}"
+        assert "ROLLBACK" not in stmt, f"ROLLBACK must not be executed: {stmt}"
+        assert "BUFFERS" not in stmt, (
+            f"BUFFERS without ANALYZE is invalid in PostgreSQL: {stmt}"
+        )
+
+    assert any(
+        stmt == "EXPLAIN (COSTS, VERBOSE, FORMAT JSON) SELECT 1"
+        for stmt in executed_statements
+    )
+
+
+async def test_async_explain_query_uses_strictly_passive_sql(monkeypatch):
+    """Async explain_query issues only static EXPLAIN without transaction or rollback."""
+    import mcp_pg_auditor
+
+    mock_conn = AsyncMock()
+    mock_conn.fetchval.return_value = (
+        '[{"Plan": {"Node Type": "Result", "Total Cost": 0.01, "Plan Rows": 1}}]'
+    )
+
+    monkeypatch.setattr(mcp_pg_auditor.asyncpg, "connect", AsyncMock(return_value=mock_conn))
+
+    auditor = mcp_pg_auditor.AsyncPostgresHealthAuditor(
+        dsn="postgresql://u:p@localhost:5432/db"
+    )
+    await auditor.explain_query(query="SELECT 1", db_alias="default")
+
+    # Verify transaction was never started
+    mock_conn.transaction.assert_not_called()
+
+    # Verify executed SQL commands
+    assert mock_conn.fetchval.call_count == 1
+    executed_stmt = mock_conn.fetchval.call_args.args[0]
+    assert "ANALYZE" not in executed_stmt, f"ANALYZE must not be executed: {executed_stmt}"
+    assert "BUFFERS" not in executed_stmt, f"BUFFERS must not be executed: {executed_stmt}"
+    assert executed_stmt == "EXPLAIN (COSTS, VERBOSE, FORMAT JSON) SELECT 1"
+
+
+def test_parser_preserves_compatibility_with_pre_analyzed_plans():
+    """analyze_execution_plan parser preserves ability to process plans with execution metrics."""
+    raw_plan = [
+        {
+            "Plan": {
+                "Node Type": "Index Scan",
+                "Relation Name": "users",
+                "Total Cost": 8.45,
+                "Plan Rows": 1,
+                "Actual Rows": 1,
+                "Actual Total Time": 0.05,
+                "Shared Hit Blocks": 4,
+            },
+            "Execution Time": 0.08,
+        }
+    ]
+    report = analyze_execution_plan(raw_plan, query="SELECT * FROM users")
+    assert report.is_analyzed is True
+    assert report.summary.execution_time_ms == 0.08
+    assert report.summary.shared_hit_blocks == 4
+

@@ -19,6 +19,10 @@ from sql_audit.domain.locks import (
     LockTree,
 )
 from sql_audit.domain.models import (
+    DEFAULT_LOCK_TIMEOUT_MS,
+    DEFAULT_MIN_SIZE_BYTES,
+    DEFAULT_MIN_TABLE_ROWS,
+    DEFAULT_STATEMENT_TIMEOUT_MS,
     AuditReport,
     Evidence,
     ExecutionMetadata,
@@ -34,6 +38,10 @@ from sql_audit.domain.plan import (
 )
 
 __all__ = [
+    "DEFAULT_LOCK_TIMEOUT_MS",
+    "DEFAULT_MIN_SIZE_BYTES",
+    "DEFAULT_MIN_TABLE_ROWS",
+    "DEFAULT_STATEMENT_TIMEOUT_MS",
     "AuditDiff",
     "AuditReport",
     "BlockingEdge",

@@ -198,3 +198,155 @@ def test_cli_canonical_json_flag(capsys):
     assert finding["finding_id"] == "PG-INDEX-INVALID:orders:idx_orders_broken"
     assert finding["severity"] == "critical"
     assert finding["evidence"][0]["evidence_id"].startswith("sha256:")
+
+
+def test_cli_and_mcp_share_canonical_defaults():
+    """CLI and MCP must share the exact same canonical audit defaults (T-02)."""
+    import inspect
+
+    import mcp_pg_auditor
+    from sql_audit.domain import (
+        DEFAULT_MIN_SIZE_BYTES,
+        DEFAULT_MIN_TABLE_ROWS,
+        ExecutionMetadata,
+    )
+
+    # 1. Domain model defaults
+    meta = ExecutionMetadata()
+    assert meta.min_size_bytes == DEFAULT_MIN_SIZE_BYTES == 0
+    assert meta.min_table_rows == DEFAULT_MIN_TABLE_ROWS == 10000
+
+    # 2. CLI build_parser defaults
+    cli_parser = audit_pg.build_parser()
+    cli_defaults = cli_parser.parse_args([])
+    assert cli_defaults.min_size == DEFAULT_MIN_SIZE_BYTES
+    assert cli_defaults.min_table_rows == DEFAULT_MIN_TABLE_ROWS
+
+    # 3. CLI PostgresHealthAuditor.run_audit signature defaults
+    cli_sig = inspect.signature(audit_pg.PostgresHealthAuditor.run_audit)
+    assert cli_sig.parameters["min_size_bytes"].default == DEFAULT_MIN_SIZE_BYTES
+    assert cli_sig.parameters["min_table_rows"].default == DEFAULT_MIN_TABLE_ROWS
+
+    # 4. MCP pg_health_audit tool signature defaults
+    mcp_tool_sig = inspect.signature(mcp_pg_auditor.pg_health_audit)
+    assert mcp_tool_sig.parameters["min_size_bytes"].default == DEFAULT_MIN_SIZE_BYTES
+    assert mcp_tool_sig.parameters["min_table_rows"].default == DEFAULT_MIN_TABLE_ROWS
+
+    # 5. MCP AsyncPostgresHealthAuditor.run_full_audit signature defaults
+    mcp_full_sig = inspect.signature(mcp_pg_auditor.AsyncPostgresHealthAuditor.run_full_audit)
+    assert mcp_full_sig.parameters["min_size_bytes"].default == DEFAULT_MIN_SIZE_BYTES
+    assert mcp_full_sig.parameters["min_table_rows"].default == DEFAULT_MIN_TABLE_ROWS
+
+    # 6. Report to_audit_report defaults
+    cli_to_sig = inspect.signature(audit_pg.DatabaseHealthReport.to_audit_report)
+    assert cli_to_sig.parameters["min_size_bytes"].default == DEFAULT_MIN_SIZE_BYTES
+    assert cli_to_sig.parameters["min_table_rows"].default == DEFAULT_MIN_TABLE_ROWS
+
+    mcp_to_sig = inspect.signature(mcp_pg_auditor.PostgresHealthReport.to_audit_report)
+    assert mcp_to_sig.parameters["min_size_bytes"].default == DEFAULT_MIN_SIZE_BYTES
+    assert mcp_to_sig.parameters["min_table_rows"].default == DEFAULT_MIN_TABLE_ROWS
+
+
+async def test_default_scope_equivalence_simulated_queries(monkeypatch):
+    """Running CLI and MCP with defaults queries identical scope parameters in SQL."""
+    from unittest.mock import AsyncMock
+
+    import mcp_pg_auditor
+
+    # 1. Capture CLI query params
+    cli_executed = []
+
+    class MockCursor:
+        def execute(self, sql, params=None):
+            cli_executed.append((sql, params))
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    class MockConn:
+        def cursor(self, *args, **kwargs):
+            return MockCursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(audit_pg.psycopg2, "connect", MagicMock(return_value=MockConn()))
+    monkeypatch.setattr(audit_pg, "HAS_PSYCOPG2", True)
+
+    cli_auditor = audit_pg.PostgresHealthAuditor(db_url="postgresql://u:p@localhost:5432/db")
+    cli_auditor.run_audit(checks=["hot", "redundant", "low-usage"])
+
+    # 2. Capture MCP query params
+    mcp_executed = []
+
+    mock_async_conn = AsyncMock()
+
+    async def mock_fetch(sql, *args):
+        mcp_executed.append((sql, list(args)))
+        return []
+
+    mock_async_conn.fetch = mock_fetch
+    monkeypatch.setattr(mcp_pg_auditor.asyncpg, "connect", AsyncMock(return_value=mock_async_conn))
+
+    mcp_auditor = mcp_pg_auditor.AsyncPostgresHealthAuditor(dsn="postgresql://u:p@localhost:5432/db")
+    await mcp_auditor.run_full_audit(
+        schemas=["public"],
+        checks=["hot_fillfactor", "redundant_indexes", "low_usage_indexes"],
+    )
+
+    # Assert redundant index min_size_bytes threshold is 0 in both
+    cli_redundant_params = next(p for s, p in cli_executed if "parsed_indexes" in s)
+    assert cli_redundant_params[0] == 0
+
+    mcp_redundant_args = next(args for s, args in mcp_executed if "parsed_indexes" in s)
+    assert mcp_redundant_args[1] == 0  # args: [schemas, min_size_bytes]
+
+    # Assert HOT updates min_table_rows threshold is 10000 in both
+    cli_hot_params = next(p for s, p in cli_executed if "n_tup_hot_upd" in s)
+    assert cli_hot_params[2] == 10000  # [min_updates, min_ratio, min_table_rows]
+
+    mcp_hot_args = next(args for s, args in mcp_executed if "n_tup_hot_upd" in s)
+    assert mcp_hot_args[2] == 10000  # [min_updates, min_ratio, min_table_rows, schemas]
+
+    # Assert low-usage min_size_bytes (0) and min_table_rows (10000) match in both
+    cli_low_usage_params = next(p for s, p in cli_executed if "idx_scan" in s)
+    assert cli_low_usage_params[1] == 0
+    assert cli_low_usage_params[2] == 10000
+
+    mcp_low_usage_args = next(args for s, args in mcp_executed if "idx_scan" in s)
+    assert mcp_low_usage_args[2] == 0  # [schemas, max_rw_ratio, min_size_bytes, min_table_rows]
+    assert mcp_low_usage_args[3] == 10000
+
+
+def test_identical_explicit_configuration_produces_identical_canonical_audit_report():
+    """Identical explicit configuration produces equivalent canonical reports and metadata."""
+    now = datetime(2026, 9, 26, 12, 0, 0, tzinfo=timezone.utc)
+
+    cli_rep = DatabaseHealthReport()
+    mcp_rep = PostgresHealthReport(database_alias="prod_db", schemas_audited=["public"])
+
+    cli_canonical = cli_rep.to_audit_report(
+        database="prod_db",
+        observed_at=now,
+        min_size_bytes=50_000,
+        min_table_rows=5000,
+    )
+    mcp_canonical = mcp_rep.to_audit_report(
+        database="prod_db",
+        observed_at=now,
+        min_size_bytes=50_000,
+        min_table_rows=5000,
+    )
+
+    cli_meta = cli_canonical.execution_metadata
+    mcp_meta = mcp_canonical.execution_metadata
+    assert cli_meta.min_size_bytes == mcp_meta.min_size_bytes == 50_000
+    assert cli_meta.min_table_rows == mcp_meta.min_table_rows == 5000
+    assert cli_canonical.findings == mcp_canonical.findings == []
+

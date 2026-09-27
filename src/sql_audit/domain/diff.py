@@ -29,9 +29,19 @@ class ChangedFinding(BaseModel):
     finding_id: str
     check: str
     object_name: str
-    previous_evidence_id: str
-    current_evidence_id: str
+    previous_evidence_ids: list[str]
+    current_evidence_ids: list[str]
     current_finding: Finding
+
+    @property
+    def previous_evidence_id(self) -> str:
+        """Backward-compatible scalar view of the first previous evidence ID."""
+        return self.previous_evidence_ids[0] if self.previous_evidence_ids else ""
+
+    @property
+    def current_evidence_id(self) -> str:
+        """Backward-compatible scalar view of the first current evidence ID."""
+        return self.current_evidence_ids[0] if self.current_evidence_ids else ""
 
 
 class DiffSummary(BaseModel):
@@ -61,3 +71,4 @@ class AuditDiff(BaseModel):
     resolved_findings: list[Finding] = Field(default_factory=list)
     unchanged_findings: list[Finding] = Field(default_factory=list)
     changed_findings: list[ChangedFinding] = Field(default_factory=list)
+    is_partial: bool = False

@@ -32,6 +32,10 @@ from sql_audit.application import (
     render_plan_report_text,
 )
 from sql_audit.domain import (
+    DEFAULT_LOCK_TIMEOUT_MS,
+    DEFAULT_MIN_SIZE_BYTES,
+    DEFAULT_MIN_TABLE_ROWS,
+    DEFAULT_STATEMENT_TIMEOUT_MS,
     BloatReport,
     LockContentionReport,
     PlanAnalysisReport,
@@ -143,10 +147,26 @@ class DatabaseHealthReport:
     invalid_indexes: list[InvalidIndexIssue] = field(default_factory=list)
     unindexed_fks: list[UnindexedFKIssue] = field(default_factory=list)
     autovacuum_dead_tuples: list[DeadTuplesIssue] = field(default_factory=list)
+    checks_executed: list[str] = field(default_factory=list)
+    checks_failed: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    is_partial: bool = False
 
     @property
     def has_critical_issues(self) -> bool:
         return bool(self.invalid_indexes or self.unindexed_fks or self.autovacuum_dead_tuples)
+
+    @property
+    def is_healthy(self) -> bool:
+        has_any_finding = bool(
+            self.hot_issues
+            or self.redundant_indexes
+            or self.low_usage_indexes
+            or self.invalid_indexes
+            or self.unindexed_fks
+            or self.autovacuum_dead_tuples
+        )
+        return not self.is_partial and len(self.errors) == 0 and not has_any_finding
 
     def to_audit_report(
         self,
@@ -156,14 +176,14 @@ class DatabaseHealthReport:
         server_version: str = "unknown",
         duration_ms: float = 0.0,
         schemas: list[str] | None = None,
-        min_size_bytes: int = 0,
-        min_table_rows: int = 10000,
+        min_size_bytes: int = DEFAULT_MIN_SIZE_BYTES,
+        min_table_rows: int = DEFAULT_MIN_TABLE_ROWS,
         audit_id: str | None = None,
     ) -> AuditReport:
         return convert_legacy_report_to_audit_report(
             report=self,
             database=database,
-            checks=checks or list(ALL_CHECKS),
+            checks=checks or (self.checks_executed if self.checks_executed else list(ALL_CHECKS)),
             observed_at=observed_at,
             server_version=server_version,
             duration_ms=duration_ms,
@@ -181,9 +201,34 @@ class DatabaseConnectionError(Exception):
 class PostgresHealthAuditor:
     """Audits PostgreSQL catalog and runtime statistics for indexing and storage anti-patterns."""
 
-    def __init__(self, db_url: str, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT):
+    def __init__(
+        self,
+        db_url: str,
+        connect_timeout: int = DEFAULT_CONNECT_TIMEOUT,
+        statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
+        lock_timeout_ms: int = DEFAULT_LOCK_TIMEOUT_MS,
+    ):
         self.db_url = db_url
         self.connect_timeout = connect_timeout
+        self.statement_timeout_ms = statement_timeout_ms
+        self.lock_timeout_ms = lock_timeout_ms
+
+    def _connect(self) -> Any:
+        if not HAS_PSYCOPG2:
+            raise RuntimeError("psycopg2 is not installed. Run: uv add psycopg2-binary")
+
+        try:
+            options = (
+                f"-c statement_timeout={self.statement_timeout_ms} "
+                f"-c lock_timeout={self.lock_timeout_ms}"
+            )
+            return psycopg2.connect(
+                self.db_url,
+                connect_timeout=self.connect_timeout,
+                options=options,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise DatabaseConnectionError(str(exc)) from exc
 
     def run_audit(
         self,
@@ -192,18 +237,15 @@ class PostgresHealthAuditor:
         max_rw_ratio: float = 0.05,
         checks: list[str] | None = None,
         schemas: list[str] | None = None,
-        min_size_bytes: int = 0,
-        min_table_rows: int = 10000,
+        min_size_bytes: int = DEFAULT_MIN_SIZE_BYTES,
+        min_table_rows: int = DEFAULT_MIN_TABLE_ROWS,
     ) -> DatabaseHealthReport:
-        if not HAS_PSYCOPG2:
-            raise RuntimeError("psycopg2 is not installed. Run: uv add psycopg2-binary")
-
-        try:
-            conn = psycopg2.connect(self.db_url, connect_timeout=self.connect_timeout)
-        except Exception as exc:  # noqa: BLE001
-            raise DatabaseConnectionError(str(exc)) from exc
+        conn = self._connect()
 
         selected = checks if checks is not None else ALL_CHECKS
+        executed_checks: list[str] = []
+        failed_checks: list[str] = []
+        audit_errors: list[str] = []
 
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -215,21 +257,66 @@ class PostgresHealthAuditor:
                 autovacuum_dead_tuples: list[DeadTuplesIssue] = []
 
                 if "hot" in selected:
-                    hot_issues = self._audit_hot_and_fillfactor(
-                        cur, min_hot_ratio_pct, min_updates_threshold, schemas, min_table_rows
-                    )
+                    try:
+                        hot_issues = self._audit_hot_and_fillfactor(
+                            cur, min_hot_ratio_pct, min_updates_threshold, schemas, min_table_rows
+                        )
+                        executed_checks.append("hot")
+                    except Exception as exc:  # noqa: BLE001
+                        conn.rollback()
+                        failed_checks.append("hot")
+                        audit_errors.append(f"hot: {exc}")
+
                 if "redundant" in selected:
-                    redundant_indexes = self._audit_redundant_indexes(cur, schemas, min_size_bytes)
+                    try:
+                        redundant_indexes = self._audit_redundant_indexes(
+                            cur, schemas, min_size_bytes
+                        )
+                        executed_checks.append("redundant")
+                    except Exception as exc:  # noqa: BLE001
+                        conn.rollback()
+                        failed_checks.append("redundant")
+                        audit_errors.append(f"redundant: {exc}")
+
                 if "low-usage" in selected:
-                    low_usage = self._audit_low_usage_indexes(
-                        cur, max_rw_ratio, schemas, min_size_bytes, min_table_rows
-                    )
+                    try:
+                        low_usage = self._audit_low_usage_indexes(
+                            cur, max_rw_ratio, schemas, min_size_bytes, min_table_rows
+                        )
+                        executed_checks.append("low-usage")
+                    except Exception as exc:  # noqa: BLE001
+                        conn.rollback()
+                        failed_checks.append("low-usage")
+                        audit_errors.append(f"low-usage: {exc}")
+
                 if "invalid" in selected:
-                    invalid_indexes = self._audit_invalid_indexes(cur, schemas)
+                    try:
+                        invalid_indexes = self._audit_invalid_indexes(cur, schemas)
+                        executed_checks.append("invalid")
+                    except Exception as exc:  # noqa: BLE001
+                        conn.rollback()
+                        failed_checks.append("invalid")
+                        audit_errors.append(f"invalid: {exc}")
+
                 if "unindexed-fks" in selected:
-                    unindexed_fks = self._audit_unindexed_fks(cur, schemas)
+                    try:
+                        unindexed_fks = self._audit_unindexed_fks(cur, schemas)
+                        executed_checks.append("unindexed-fks")
+                    except Exception as exc:  # noqa: BLE001
+                        conn.rollback()
+                        failed_checks.append("unindexed-fks")
+                        audit_errors.append(f"unindexed-fks: {exc}")
+
                 if "dead-tuples" in selected:
-                    autovacuum_dead_tuples = self._audit_autovacuum_dead_tuples(cur, schemas)
+                    try:
+                        autovacuum_dead_tuples = self._audit_autovacuum_dead_tuples(cur, schemas)
+                        executed_checks.append("dead-tuples")
+                    except Exception as exc:  # noqa: BLE001
+                        conn.rollback()
+                        failed_checks.append("dead-tuples")
+                        audit_errors.append(f"dead-tuples: {exc}")
+
+                is_partial = bool(failed_checks or audit_errors)
 
                 return DatabaseHealthReport(
                     hot_issues=hot_issues,
@@ -238,20 +325,17 @@ class PostgresHealthAuditor:
                     invalid_indexes=invalid_indexes,
                     unindexed_fks=unindexed_fks,
                     autovacuum_dead_tuples=autovacuum_dead_tuples,
+                    checks_executed=executed_checks,
+                    checks_failed=failed_checks,
+                    errors=audit_errors,
+                    is_partial=is_partial,
                 )
         finally:
             conn.close()
 
     def audit_locks(self) -> LockContentionReport:
         """Inspects active lock contention and reconstructs blocking trees."""
-        if not HAS_PSYCOPG2:
-            raise RuntimeError("psycopg2 is not installed. Run: uv add psycopg2-binary")
-
-        try:
-            conn = psycopg2.connect(self.db_url, connect_timeout=self.connect_timeout)
-        except Exception as exc:  # noqa: BLE001
-            raise DatabaseConnectionError(str(exc)) from exc
-
+        conn = self._connect()
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(SQL_LOCK_CONTENTION)
@@ -267,14 +351,7 @@ class PostgresHealthAuditor:
         min_bloat_ratio_pct: float = 20.0,
     ) -> BloatReport:
         """Estimates physical bloat for tables and B-tree indexes from catalog statistics."""
-        if not HAS_PSYCOPG2:
-            raise RuntimeError("psycopg2 is not installed. Run: uv add psycopg2-binary")
-
-        try:
-            conn = psycopg2.connect(self.db_url, connect_timeout=self.connect_timeout)
-        except Exception as exc:  # noqa: BLE001
-            raise DatabaseConnectionError(str(exc)) from exc
-
+        conn = self._connect()
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 if schemas:
@@ -301,38 +378,17 @@ class PostgresHealthAuditor:
     def explain_query(
         self,
         query: str,
-        analyze: bool = False,
     ) -> PlanAnalysisReport:
-        """Runs EXPLAIN (or safe transactional EXPLAIN ANALYZE) and audits the execution plan."""
-        if not HAS_PSYCOPG2:
-            raise RuntimeError("psycopg2 is not installed. Run: uv add psycopg2-binary")
-
-        try:
-            conn = psycopg2.connect(self.db_url, connect_timeout=self.connect_timeout)
-        except Exception as exc:  # noqa: BLE001
-            raise DatabaseConnectionError(str(exc)) from exc
-
+        """Runs static EXPLAIN and audits the estimated execution plan."""
+        conn = self._connect()
         try:
             with conn.cursor() as cur:
-                if analyze:
-                    # Transactional rollback protects against mutating DML
-                    cur.execute("BEGIN;")
-                    explain_sql = f"EXPLAIN (ANALYZE, BUFFERS, COSTS, VERBOSE, FORMAT JSON) {query}"
-                    try:
-                        cur.execute(explain_sql)
-                        row = cur.fetchone()
-                        if not row:
-                            raise RuntimeError("EXPLAIN did not return plan data")
-                        plan_data = row[0]
-                    finally:
-                        cur.execute("ROLLBACK;")
-                else:
-                    explain_sql = f"EXPLAIN (BUFFERS, COSTS, VERBOSE, FORMAT JSON) {query}"
-                    cur.execute(explain_sql)
-                    row = cur.fetchone()
-                    if not row:
-                        raise RuntimeError("EXPLAIN did not return plan data")
-                    plan_data = row[0]
+                explain_sql = f"EXPLAIN (COSTS, VERBOSE, FORMAT JSON) {query}"
+                cur.execute(explain_sql)
+                row = cur.fetchone()
+                if not row:
+                    raise RuntimeError("EXPLAIN did not return plan data")
+                plan_data = row[0]
 
                 return analyze_execution_plan(
                     raw_plan_data=plan_data,
@@ -443,6 +499,13 @@ def render_text(report: DatabaseHealthReport) -> str:
     lines.append("        POSTGRESQL STORAGE & INDEX HEALTH REPORT")
     lines.append("=" * 65)
 
+    if report.is_partial or report.errors:
+        lines.append("")
+        lines.append("  [!] WARNING: PARTIAL AUDIT (DEGRADED EXECUTION)")
+        for err in report.errors:
+            lines.append(f"      * Check failure: {err}")
+        lines.append("=" * 65)
+
     # 1. Invalid Indexes (Critical)
     lines.append("")
     lines.append(f"[1] INVALID INDEXES (indisvalid = false): {len(report.invalid_indexes)}")
@@ -453,8 +516,15 @@ def render_text(report: DatabaseHealthReport) -> str:
             lines.append(f"  * Table: {inv.child_table}")
             lines.append(f"    - Invalid index: {inv.invalid_index} (Size: {inv.index_size})")
             lines.append(
-                f"    - Suggestion: DROP INDEX CONCURRENTLY {inv.invalid_index}; "
-                "then rebuild if necessary."
+                "    - Diagnostic: Index is marked invalid (indisvalid = false) "
+                "from a failed build."
+            )
+            lines.append(
+                "    - Considerations: Consumes storage and write overhead "
+                "while ignored by the planner; "
+            )
+            lines.append(
+                "      evaluate cleanup and rebuild requirements during maintenance windows."
             )
             lines.append("")
 
@@ -468,7 +538,15 @@ def render_text(report: DatabaseHealthReport) -> str:
             lines.append(f"    - FK: {fk.fk_name}")
             lines.append(f"    - Definition: {fk.fk_definition}")
             lines.append(
-                "    - Suggestion: Consider CREATE INDEX CONCURRENTLY to prevent table locks."
+                "    - Diagnostic: Foreign key constraint lacks a supporting "
+                "index on referencing columns."
+            )
+            lines.append(
+                "    - Considerations: Parent table updates/deletes may acquire "
+                "share locks on child table; "
+            )
+            lines.append(
+                "      evaluate indexing referencing columns to prevent lock contention."
             )
             lines.append("")
 
@@ -487,7 +565,12 @@ def render_text(report: DatabaseHealthReport) -> str:
             last_vac = dt.last_vacuum.isoformat() if dt.last_vacuum else "never"
             lines.append(f"    - Last Autovacuum: {last_auto} | Last Vacuum: {last_vac}")
             lines.append(
-                "    - Suggestion: Check long-running transactions and autovacuum settings."
+                "    - Diagnostic: Excessive dead tuple accumulation indicates "
+                "autovacuum lag or starvation."
+            )
+            lines.append(
+                "    - Considerations: Investigate uncommitted long-running transactions or "
+                "autovacuum settings preventing dead tuple reclamation."
             )
             lines.append("")
 
@@ -501,7 +584,17 @@ def render_text(report: DatabaseHealthReport) -> str:
             lines.append(f"    - Redundant: {idx.redundant_index} (Size: {idx.redundant_size})")
             lines.append(f"    - Covered by: {idx.covering_index}")
             lines.append(f"    - Redundant def: {idx.redundant_def}")
-            lines.append(f"    - Suggestion: Consider DROP INDEX {idx.redundant_index};")
+            lines.append(
+                f"    - Diagnostic: Index is a left-prefix duplicate covered by "
+                f"'{idx.covering_index}'."
+            )
+            lines.append(
+                "    - Considerations: Consumes cache and write overhead redundantly; "
+                "verify query usage "
+            )
+            lines.append(
+                "      and constraint requirements before planning index retirement."
+            )
             lines.append("")
 
     # 5. HOT Updates & Fillfactor
@@ -524,8 +617,13 @@ def render_text(report: DatabaseHealthReport) -> str:
             lines.append(f"    - Fillfactor: {issue.fillfactor}%{warning}")
             if issue.fillfactor_warning:
                 lines.append(
-                    f"    - Suggestion: ALTER TABLE {issue.table_name} "
-                    f"SET (fillfactor = 85); VACUUM FULL {issue.table_name};"
+                    "    - Diagnostic: Default 100% fillfactor leaves no page headroom "
+                    "for HOT updates."
+                )
+                lines.append(
+                    "    - Considerations: Frequent non-indexed updates trigger heap bloat and "
+                    "WAL amplification; evaluate lowering fillfactor and scheduling compaction "
+                    "during maintenance windows."
                 )
                 lines.append("")
 
@@ -543,7 +641,14 @@ def render_text(report: DatabaseHealthReport) -> str:
                 f"    - Read Scans: {low.index_scans} | "
                 f"Table Writes: {low.table_writes} (Ratio: {low.read_write_ratio})"
             )
-            lines.append("    - Suggestion: Evaluate if this index is required for queries.")
+            lines.append(
+                "    - Diagnostic: High write maintenance overhead with "
+                "negligible scan utilization."
+            )
+            lines.append(
+                "    - Considerations: Verify query patterns, unique constraints, and operational "
+                "requirements before considering index retirement."
+            )
             lines.append("")
 
     lines.append("=" * 65)
@@ -583,7 +688,7 @@ def render_json(report: DatabaseHealthReport, database: str, checks: list[str]) 
             {key: _jsonable(value) for key, value in asdict(issue).items()}
             for issue in getattr(report, field_name)
         ]
-    return {
+    data: dict[str, Any] = {
         "database": database,
         "checks": list(checks),
         "has_critical_issues": report.has_critical_issues,
@@ -597,11 +702,19 @@ def render_json(report: DatabaseHealthReport, database: str, checks: list[str]) 
         },
         "issues": issues,
     }
+    if report.is_partial or report.errors:
+        data["is_partial"] = report.is_partial
+        data["checks_executed"] = report.checks_executed
+        data["checks_failed"] = report.checks_failed
+        data["errors"] = report.errors
+    return data
 
 
 def has_issues(report: DatabaseHealthReport) -> bool:
     return bool(
-        report.hot_issues
+        report.is_partial
+        or report.errors
+        or report.hot_issues
         or report.redundant_indexes
         or report.low_usage_indexes
         or report.invalid_indexes
@@ -731,8 +844,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-size",
         type=int,
-        default=0,
-        help="Ignore indexes below this size in bytes (redundant and low-usage checks, default: 0)",
+        default=DEFAULT_MIN_SIZE_BYTES,
+        help=(
+            "Ignore indexes below this size in bytes "
+            f"(redundant and low-usage checks, default: {DEFAULT_MIN_SIZE_BYTES})"
+        ),
     )
     parser.add_argument(
         "--json",
@@ -781,9 +897,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-table-rows",
         type=int,
-        default=10000,
-        help="Only report HOT/low-usage issues for tables with at least N live rows "
-        "(default: 10000); 0 disables the threshold",
+        default=DEFAULT_MIN_TABLE_ROWS,
+        help=f"Only report HOT/low-usage issues for tables with at least N live rows "
+        f"(default: {DEFAULT_MIN_TABLE_ROWS}); 0 disables the threshold",
     )
     parser.add_argument(
         "--locks",
@@ -816,11 +932,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--explain-file",
         default=None,
         help="Path to SQL file containing query to explain and audit",
-    )
-    parser.add_argument(
-        "--analyze",
-        action="store_true",
-        help="Execute query inside a rolled-back transaction to capture runtime stats and buffers",
     )
     return parser
 
@@ -870,7 +981,7 @@ def main(
             return 1
 
         try:
-            plan_report = auditor.explain_query(query=query_text, analyze=args.analyze)
+            plan_report = auditor.explain_query(query=query_text)
         except DatabaseConnectionError as exc:
             print(f"Connection failed: {exc}", file=sys.stderr)
             return 1

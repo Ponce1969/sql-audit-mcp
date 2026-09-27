@@ -10,7 +10,16 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
+DEFAULT_MIN_SIZE_BYTES: int = 0
+DEFAULT_MIN_TABLE_ROWS: int = 10000
+DEFAULT_STATEMENT_TIMEOUT_MS: int = 15_000
+DEFAULT_LOCK_TIMEOUT_MS: int = 3_000
+
 __all__ = [
+    "DEFAULT_LOCK_TIMEOUT_MS",
+    "DEFAULT_MIN_SIZE_BYTES",
+    "DEFAULT_MIN_TABLE_ROWS",
+    "DEFAULT_STATEMENT_TIMEOUT_MS",
     "AuditReport",
     "Evidence",
     "ExecutionMetadata",
@@ -70,8 +79,8 @@ class ExecutionMetadata(BaseModel):
 
     duration_ms: float = 0.0
     schemas: list[str] | None = None
-    min_size_bytes: int = 0
-    min_table_rows: int = 10000
+    min_size_bytes: int = DEFAULT_MIN_SIZE_BYTES
+    min_table_rows: int = DEFAULT_MIN_TABLE_ROWS
 
 
 class AuditReport(BaseModel):
@@ -86,7 +95,19 @@ class AuditReport(BaseModel):
     observed_at: datetime
     execution_metadata: ExecutionMetadata = Field(default_factory=ExecutionMetadata)
     checks_executed: list[str]
+    checks_requested: list[str] = Field(default_factory=list)
+    checks_failed: list[str] = Field(default_factory=list)
+    is_partial: bool = False
     has_critical_issues: bool
     summary: dict[str, int] = Field(default_factory=dict)
     findings: list[Finding] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+
+    @property
+    def is_healthy(self) -> bool:
+        """Determines if the database audit is healthy.
+
+        An audit is healthy ONLY if it completed fully (not partial, no errors)
+        and has zero findings.
+        """
+        return not self.is_partial and len(self.errors) == 0 and len(self.findings) == 0

@@ -1,6 +1,9 @@
 """Unit tests for sql_audit.domain models and hashing stability."""
 
+import inspect
 from datetime import datetime, timezone
+
+import pytest
 
 from sql_audit.domain import (
     AuditReport,
@@ -15,10 +18,83 @@ from sql_audit.domain import (
 
 def test_finding_id_stable_across_counter_variations():
     """finding_id must remain identical even when dead_tuples or scans change."""
-    fid_run1 = compute_stable_finding_id("PG-VACUUM-DEAD-TUPLES", "table", "public.events")
-    fid_run2 = compute_stable_finding_id("PG-VACUUM-DEAD-TUPLES", "table", "public.events")
+    fid_run1 = compute_stable_finding_id("PG-VACUUM-DEAD-TUPLES", "public.events")
+    fid_run2 = compute_stable_finding_id("PG-VACUUM-DEAD-TUPLES", "public.events")
     assert fid_run1 == "PG-VACUUM-DEAD-TUPLES:public.events"
     assert fid_run1 == fid_run2
+
+
+def test_compute_stable_finding_id_signature_has_no_object_type():
+    """compute_stable_finding_id signature must not accept object_type (T-11)."""
+    sig = inspect.signature(compute_stable_finding_id)
+    assert "object_type" not in sig.parameters, "object_type must be removed from signature"
+    assert list(sig.parameters.keys()) == ["check_code", "object_name", "sub_object"]
+
+    # Keyword argument object_type must be rejected
+    with pytest.raises(TypeError):
+        compute_stable_finding_id(  # type: ignore[call-arg]
+            check_code="PG-TEST",
+            object_name="test_obj",
+            object_type="table",
+        )
+
+
+def test_compute_stable_finding_id_preserves_historical_format():
+    """Historical finding_id format must remain bit-for-bit identical (T-11)."""
+    # 1. Without sub_object -> {CHECK_CODE}:{object_name}
+    assert (
+        compute_stable_finding_id("PG-VACUUM-DEAD-TUPLES", "public.events")
+        == "PG-VACUUM-DEAD-TUPLES:public.events"
+    )
+    assert (
+        compute_stable_finding_id("PG-HOT-FILLFACTOR", "users")
+        == "PG-HOT-FILLFACTOR:users"
+    )
+    assert (
+        compute_stable_finding_id("PG-LOCK-CONTENTION", "PID_1234")
+        == "PG-LOCK-CONTENTION:PID_1234"
+    )
+    assert (
+        compute_stable_finding_id("PG-BLOAT-TABLE", "public.users")
+        == "PG-BLOAT-TABLE:public.users"
+    )
+
+    # 2. With sub_object -> {CHECK_CODE}:{object_name}:{sub_object}
+    assert (
+        compute_stable_finding_id("PG-INDEX-INVALID", "orders", "idx_orders_broken")
+        == "PG-INDEX-INVALID:orders:idx_orders_broken"
+    )
+    assert (
+        compute_stable_finding_id("PG-FK-UNINDEXED", "order_items", "fk_items_prod")
+        == "PG-FK-UNINDEXED:order_items:fk_items_prod"
+    )
+    assert (
+        compute_stable_finding_id("PG-INDEX-REDUNDANT", "users", "idx_users_email")
+        == "PG-INDEX-REDUNDANT:users:idx_users_email"
+    )
+    assert (
+        compute_stable_finding_id("PG-INDEX-LOW-USAGE", "orders", "idx_orders_status")
+        == "PG-INDEX-LOW-USAGE:orders:idx_orders_status"
+    )
+    assert (
+        compute_stable_finding_id("PG-BLOAT-INDEX", "public.users", "idx_users_email")
+        == "PG-BLOAT-INDEX:public.users:idx_users_email"
+    )
+
+
+def test_finding_domain_model_preserves_object_type_attribute():
+    """Finding.object_type must remain in the domain model even though removed from hasher."""
+    finding = Finding(
+        finding_id=compute_stable_finding_id("PG-BLOAT-TABLE", "public.users"),
+        check="table_bloat",
+        severity=Severity.HIGH,
+        object_type="table",
+        object_name="public.users",
+        reason="Test table bloat",
+    )
+    assert finding.object_type == "table"
+    assert finding.object_name == "public.users"
+    assert finding.finding_id == "PG-BLOAT-TABLE:public.users"
 
 
 def test_evidence_id_changes_when_metrics_change():

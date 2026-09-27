@@ -6,6 +6,8 @@ from typing import Any
 
 from sql_audit.domain.hasher import compute_evidence_id, compute_stable_finding_id
 from sql_audit.domain.models import (
+    DEFAULT_MIN_SIZE_BYTES,
+    DEFAULT_MIN_TABLE_ROWS,
     AuditReport,
     Evidence,
     ExecutionMetadata,
@@ -40,7 +42,7 @@ def map_invalid_index_to_finding(
     )
     return Finding(
         finding_id=compute_stable_finding_id(
-            "PG-INDEX-INVALID", "table", child_table, invalid_index
+            "PG-INDEX-INVALID", child_table, invalid_index
         ),
         check="invalid_indexes",
         severity=Severity.CRITICAL,
@@ -77,7 +79,7 @@ def map_unindexed_fk_to_finding(
         evidence_id=evidence_id,
     )
     return Finding(
-        finding_id=compute_stable_finding_id("PG-FK-UNINDEXED", "table", child_table, fk_name),
+        finding_id=compute_stable_finding_id("PG-FK-UNINDEXED", child_table, fk_name),
         check="unindexed_fks",
         severity=Severity.HIGH,
         object_type="constraint",
@@ -120,7 +122,7 @@ def map_dead_tuples_to_finding(
         evidence_id=evidence_id,
     )
     return Finding(
-        finding_id=compute_stable_finding_id("PG-VACUUM-DEAD-TUPLES", "table", table_name),
+        finding_id=compute_stable_finding_id("PG-VACUUM-DEAD-TUPLES", table_name),
         check="autovacuum_dead_tuples",
         severity=Severity.HIGH,
         object_type="table",
@@ -167,7 +169,7 @@ def map_hot_to_finding(
         evidence_id=evidence_id,
     )
     return Finding(
-        finding_id=compute_stable_finding_id("PG-HOT-FILLFACTOR", "table", table_name),
+        finding_id=compute_stable_finding_id("PG-HOT-FILLFACTOR", table_name),
         check="hot_fillfactor",
         severity=Severity.MEDIUM,
         object_type="table",
@@ -211,7 +213,7 @@ def map_redundant_index_to_finding(
     )
     return Finding(
         finding_id=compute_stable_finding_id(
-            "PG-INDEX-REDUNDANT", "table", table_name, redundant_index
+            "PG-INDEX-REDUNDANT", table_name, redundant_index
         ),
         check="redundant_indexes",
         severity=Severity.LOW,
@@ -256,7 +258,7 @@ def map_low_usage_index_to_finding(
         evidence_id=evidence_id,
     )
     return Finding(
-        finding_id=compute_stable_finding_id("PG-INDEX-LOW-USAGE", "table", table_name, index_name),
+        finding_id=compute_stable_finding_id("PG-INDEX-LOW-USAGE", table_name, index_name),
         check="low_usage_indexes",
         severity=Severity.LOW,
         object_type="index",
@@ -271,11 +273,14 @@ def build_audit_report(
     checks_executed: list[str],
     findings: list[Finding],
     errors: list[str] | None = None,
+    checks_requested: list[str] | None = None,
+    checks_failed: list[str] | None = None,
+    is_partial: bool | None = None,
     observed_at: datetime | None = None,
     duration_ms: float = 0.0,
     schemas: list[str] | None = None,
-    min_size_bytes: int = 0,
-    min_table_rows: int = 10000,
+    min_size_bytes: int = DEFAULT_MIN_SIZE_BYTES,
+    min_table_rows: int = DEFAULT_MIN_TABLE_ROWS,
     server_version: str = "unknown",
     audit_id: str | None = None,
 ) -> AuditReport:
@@ -283,6 +288,10 @@ def build_audit_report(
     obs_time = observed_at or datetime.now(timezone.utc)
     aid = audit_id or f"audit_{uuid.uuid4().hex[:12]}"
     has_critical = any(f.severity == Severity.CRITICAL for f in findings)
+    errs = list(errors or [])
+    failed = list(checks_failed or [])
+    requested = list(checks_requested) if checks_requested is not None else list(checks_executed)
+    partial = is_partial if is_partial is not None else bool(failed or errs)
 
     summary: dict[str, int] = {}
     for f in findings:
@@ -301,10 +310,13 @@ def build_audit_report(
             min_table_rows=min_table_rows,
         ),
         checks_executed=list(checks_executed),
+        checks_requested=requested,
+        checks_failed=failed,
+        is_partial=partial,
         has_critical_issues=has_critical,
         summary=summary,
         findings=findings,
-        errors=errors or [],
+        errors=errs,
     )
 
 
@@ -324,8 +336,8 @@ def convert_legacy_report_to_audit_report(
     server_version: str = "unknown",
     duration_ms: float = 0.0,
     schemas: list[str] | None = None,
-    min_size_bytes: int = 0,
-    min_table_rows: int = 10000,
+    min_size_bytes: int = DEFAULT_MIN_SIZE_BYTES,
+    min_table_rows: int = DEFAULT_MIN_TABLE_ROWS,
     audit_id: str | None = None,
 ) -> AuditReport:
     """Translates a legacy DatabaseHealthReport or PostgresHealthReport into an AuditReport."""
@@ -363,10 +375,28 @@ def convert_legacy_report_to_audit_report(
         row = _extract_row(item)
         findings.append(map_low_usage_index_to_finding(row, obs_time, server_version))
 
+    report_executed = getattr(report, "checks_executed", None)
+    report_failed = getattr(report, "checks_failed", None)
+    report_errors = getattr(report, "errors", None)
+    report_is_partial = getattr(report, "is_partial", None)
+
+    executed_checks = list(report_executed) if report_executed is not None else checks
+    failed_checks = list(report_failed or [])
+    errors_list = list(report_errors or [])
+    is_partial_val = (
+        report_is_partial
+        if report_is_partial is not None
+        else bool(failed_checks or errors_list)
+    )
+
     return build_audit_report(
         database=database,
-        checks_executed=checks,
+        checks_executed=executed_checks,
+        checks_requested=checks,
+        checks_failed=failed_checks,
+        is_partial=is_partial_val,
         findings=findings,
+        errors=errors_list,
         observed_at=obs_time,
         duration_ms=duration_ms,
         schemas=schemas,

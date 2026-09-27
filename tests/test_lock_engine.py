@@ -226,3 +226,174 @@ async def test_mcp_pg_locks_tool(monkeypatch):
     assert result.total_blocked_processes == 0
     assert result.distinct_root_blockers == 0
     assert len(result.trees) == 0
+
+
+def test_lock_engine_cycle_detection_terminates_cleanly():
+    """A closed dependency cycle (100 -> 200 -> 100) must terminate cleanly
+    without RecursionError.
+    """
+    rows = [
+        {
+            "blocked_pid": 200,
+            "blocked_user": "u2",
+            "blocked_app": "app2",
+            "blocked_client_addr": "127.0.0.1",
+            "blocked_duration_sec": 10.0,
+            "blocked_xact_age_sec": 10.0,
+            "blocked_wait_event_type": "Lock",
+            "blocked_wait_event": "transactionid",
+            "blocked_state": "active",
+            "blocked_query": "UPDATE t SET x = 1 WHERE id = 1;",
+            "blocking_pid": 100,
+            "blocking_user": "u1",
+            "blocking_app": "app1",
+            "blocking_client_addr": "127.0.0.1",
+            "blocking_duration_sec": 20.0,
+            "blocking_xact_age_sec": 20.0,
+            "blocking_state": "active",
+            "blocking_wait_event_type": "Lock",
+            "blocking_wait_event": "transactionid",
+            "blocking_query": "UPDATE t SET x = 2 WHERE id = 2;",
+        },
+        {
+            "blocked_pid": 100,
+            "blocked_user": "u1",
+            "blocked_app": "app1",
+            "blocked_client_addr": "127.0.0.1",
+            "blocked_duration_sec": 20.0,
+            "blocked_xact_age_sec": 20.0,
+            "blocked_wait_event_type": "Lock",
+            "blocked_wait_event": "transactionid",
+            "blocked_state": "active",
+            "blocked_query": "UPDATE t SET x = 2 WHERE id = 2;",
+            "blocking_pid": 200,
+            "blocking_user": "u2",
+            "blocking_app": "app2",
+            "blocking_client_addr": "127.0.0.1",
+            "blocking_duration_sec": 10.0,
+            "blocking_xact_age_sec": 10.0,
+            "blocking_state": "active",
+            "blocking_wait_event_type": "Lock",
+            "blocking_wait_event": "transactionid",
+            "blocking_query": "UPDATE t SET x = 1 WHERE id = 1;",
+        },
+    ]
+
+    report = build_lock_contention_report(rows, database="testdb")
+
+    assert len(report.trees) >= 1
+    tree = report.trees[0]
+    # Verify no infinite loop occurred and total_blocked avoids duplicate counting
+    assert tree.total_blocked == 2
+    assert set(tree.blocked_pids) == {100, 200}
+    # Verify cycle is explicitly identified in chain_representation
+    assert "cycle detected" in tree.chain_representation.lower()
+
+
+def test_lock_engine_convergent_dag_preserves_both_branches():
+    """A convergent DAG diamond (100 -> 200 -> 400 and 100 -> 300 -> 400)
+    must preserve both branches without false cycle detection.
+    """
+    rows = [
+        {
+            "blocked_pid": 200,
+            "blocked_user": "u2",
+            "blocked_app": "app2",
+            "blocked_client_addr": "127.0.0.1",
+            "blocked_duration_sec": 15.0,
+            "blocked_xact_age_sec": 15.0,
+            "blocked_wait_event_type": "Lock",
+            "blocked_wait_event": "relation",
+            "blocked_state": "active",
+            "blocked_query": "SELECT * FROM t2;",
+            "blocking_pid": 100,
+            "blocking_user": "root",
+            "blocking_app": "app_root",
+            "blocking_client_addr": "127.0.0.1",
+            "blocking_duration_sec": 45.0,
+            "blocking_xact_age_sec": 45.0,
+            "blocking_state": "active",
+            "blocking_wait_event_type": "Lock",
+            "blocking_wait_event": "relation",
+            "blocking_query": "ALTER TABLE t1 ADD COLUMN c int;",
+        },
+        {
+            "blocked_pid": 300,
+            "blocked_user": "u3",
+            "blocked_app": "app3",
+            "blocked_client_addr": "127.0.0.1",
+            "blocked_duration_sec": 12.0,
+            "blocked_xact_age_sec": 12.0,
+            "blocked_wait_event_type": "Lock",
+            "blocked_wait_event": "relation",
+            "blocked_state": "active",
+            "blocked_query": "SELECT * FROM t3;",
+            "blocking_pid": 100,
+            "blocking_user": "root",
+            "blocking_app": "app_root",
+            "blocking_client_addr": "127.0.0.1",
+            "blocking_duration_sec": 45.0,
+            "blocking_xact_age_sec": 45.0,
+            "blocking_state": "active",
+            "blocking_wait_event_type": "Lock",
+            "blocking_wait_event": "relation",
+            "blocking_query": "ALTER TABLE t1 ADD COLUMN c int;",
+        },
+        {
+            "blocked_pid": 400,
+            "blocked_user": "u4",
+            "blocked_app": "app4",
+            "blocked_client_addr": "127.0.0.1",
+            "blocked_duration_sec": 5.0,
+            "blocked_xact_age_sec": 5.0,
+            "blocked_wait_event_type": "Lock",
+            "blocked_wait_event": "tuple",
+            "blocked_state": "active",
+            "blocked_query": "SELECT * FROM t4;",
+            "blocking_pid": 200,
+            "blocking_user": "u2",
+            "blocking_app": "app2",
+            "blocking_client_addr": "127.0.0.1",
+            "blocking_duration_sec": 15.0,
+            "blocking_xact_age_sec": 15.0,
+            "blocking_state": "active",
+            "blocking_wait_event_type": "Lock",
+            "blocking_wait_event": "relation",
+            "blocking_query": "SELECT * FROM t2;",
+        },
+        {
+            "blocked_pid": 400,
+            "blocked_user": "u4",
+            "blocked_app": "app4",
+            "blocked_client_addr": "127.0.0.1",
+            "blocked_duration_sec": 5.0,
+            "blocked_xact_age_sec": 5.0,
+            "blocked_wait_event_type": "Lock",
+            "blocked_wait_event": "tuple",
+            "blocked_state": "active",
+            "blocked_query": "SELECT * FROM t4;",
+            "blocking_pid": 300,
+            "blocking_user": "u3",
+            "blocking_app": "app3",
+            "blocking_client_addr": "127.0.0.1",
+            "blocking_duration_sec": 12.0,
+            "blocking_xact_age_sec": 12.0,
+            "blocking_state": "active",
+            "blocking_wait_event_type": "Lock",
+            "blocking_wait_event": "relation",
+            "blocking_query": "SELECT * FROM t3;",
+        },
+    ]
+
+    report = build_lock_contention_report(rows, database="testdb")
+
+    assert len(report.trees) == 1
+    tree = report.trees[0]
+    assert tree.root_pid == 100
+    # Distinct blocked processes in diamond: 200, 300, 400
+    assert tree.total_blocked == 3
+    assert set(tree.blocked_pids) == {200, 300, 400}
+    # Both paths leading to 400 must be present in chain representation
+    assert tree.chain_representation.count("PID 400") == 2
+    # Neither branch should be misclassified as a cycle
+    assert "cycle detected" not in tree.chain_representation.lower()

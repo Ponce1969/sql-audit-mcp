@@ -226,3 +226,222 @@ def test_cli_diff_flow(tmp_path, capsys):
     assert data["previous_audit_id"] == "audit_prev_101"
     assert data["summary"]["new_count"] == 1
     assert data["new_findings"][0]["finding_id"] == "PG-INDEX-INVALID:orders:idx_orders_bad"
+
+
+def _make_evidence(query_name: str, values: dict) -> Evidence:
+    now = datetime(2026, 9, 26, 12, 0, 0, tzinfo=timezone.utc)
+    eid = compute_evidence_id("pg_stat", query_name, values)
+    return Evidence(
+        source="pg_stat",
+        observed_at=now,
+        server_version="16.4",
+        query_name=query_name,
+        values=values,
+        evidence_id=eid,
+    )
+
+
+def _make_report(
+    findings: list[Finding],
+    audit_id: str = "a1",
+    now: datetime | None = None,
+) -> AuditReport:
+    obs_time = now or datetime(2026, 9, 26, 12, 0, 0, tzinfo=timezone.utc)
+    return AuditReport(
+        audit_id=audit_id,
+        database="db",
+        observed_at=obs_time,
+        checks_executed=["check_x"],
+        has_critical_issues=False,
+        findings=findings,
+    )
+
+
+def test_diff_multi_evidence_permutation_is_unchanged():
+    """Permutation of evidence ([A, B] vs [B, A]) must be UNCHANGED under unordered semantics."""
+    now = datetime(2026, 9, 26, 12, 0, 0, tzinfo=timezone.utc)
+    ev_a = _make_evidence("check_x", {"metric": 10})
+    ev_b = _make_evidence("check_x", {"metric": 20})
+
+    f_prev = Finding(
+        finding_id="PG-CHECK:table1",
+        check="check_x",
+        severity=Severity.HIGH,
+        object_type="table",
+        object_name="table1",
+        reason="desc",
+        evidence=[ev_a, ev_b],
+    )
+    f_curr = Finding(
+        finding_id="PG-CHECK:table1",
+        check="check_x",
+        severity=Severity.HIGH,
+        object_type="table",
+        object_name="table1",
+        reason="desc",
+        evidence=[ev_b, ev_a],
+    )
+
+    r_prev = _make_report([f_prev], audit_id="a1", now=now)
+    r_curr = _make_report([f_curr], audit_id="a2", now=now)
+
+    diff = compare_audit_reports(r_prev, r_curr, compared_at=now)
+    assert len(diff.unchanged_findings) == 1
+    assert len(diff.changed_findings) == 0
+    assert diff.summary.unchanged_count == 1
+    assert diff.summary.changed_count == 0
+
+
+def test_diff_multi_evidence_secondary_change_is_detected():
+    """Mutation of secondary evidence ([A, B] vs [A, C]) must be detected as CHANGED."""
+    now = datetime(2026, 9, 26, 12, 0, 0, tzinfo=timezone.utc)
+    ev_a = _make_evidence("check_x", {"metric": 10})
+    ev_b = _make_evidence("check_x", {"metric": 20})
+    ev_c = _make_evidence("check_x", {"metric": 30})
+
+    f_prev = Finding(
+        finding_id="PG-CHECK:table1",
+        check="check_x",
+        severity=Severity.HIGH,
+        object_type="table",
+        object_name="table1",
+        reason="desc",
+        evidence=[ev_a, ev_b],
+    )
+    f_curr = Finding(
+        finding_id="PG-CHECK:table1",
+        check="check_x",
+        severity=Severity.HIGH,
+        object_type="table",
+        object_name="table1",
+        reason="desc",
+        evidence=[ev_a, ev_c],
+    )
+
+    r_prev = _make_report([f_prev], audit_id="a1", now=now)
+    r_curr = _make_report([f_curr], audit_id="a2", now=now)
+
+    diff = compare_audit_reports(r_prev, r_curr, compared_at=now)
+    assert len(diff.changed_findings) == 1
+    assert len(diff.unchanged_findings) == 0
+    assert diff.summary.changed_count == 1
+    assert diff.summary.unchanged_count == 0
+
+
+def test_diff_multi_evidence_addition_and_removal():
+    """Adding or removing evidence ([A] vs [A, B] and [A, B] vs [A]) must produce CHANGED."""
+    now = datetime(2026, 9, 26, 12, 0, 0, tzinfo=timezone.utc)
+    ev_a = _make_evidence("check_x", {"metric": 10})
+    ev_b = _make_evidence("check_x", {"metric": 20})
+
+    f_single = Finding(
+        finding_id="PG-CHECK:table1",
+        check="check_x",
+        severity=Severity.HIGH,
+        object_type="table",
+        object_name="table1",
+        reason="desc",
+        evidence=[ev_a],
+    )
+    f_double = Finding(
+        finding_id="PG-CHECK:table1",
+        check="check_x",
+        severity=Severity.HIGH,
+        object_type="table",
+        object_name="table1",
+        reason="desc",
+        evidence=[ev_a, ev_b],
+    )
+
+    r_single = _make_report([f_single], audit_id="a1", now=now)
+    r_double = _make_report([f_double], audit_id="a2", now=now)
+
+    # 1. Addition: [A] -> [A, B]
+    diff_add = compare_audit_reports(r_single, r_double, compared_at=now)
+    assert len(diff_add.changed_findings) == 1
+    assert len(diff_add.unchanged_findings) == 0
+
+    # 2. Removal: [A, B] -> [A]
+    diff_rem = compare_audit_reports(r_double, r_single, compared_at=now)
+    assert len(diff_rem.changed_findings) == 1
+    assert len(diff_rem.unchanged_findings) == 0
+
+
+def test_diff_multi_evidence_cardinality_duplicates_is_changed():
+    """Cardinality matters: [A] vs [A, A] must be CHANGED (multiset semantics, not set)."""
+    now = datetime(2026, 9, 26, 12, 0, 0, tzinfo=timezone.utc)
+    ev_a = _make_evidence("check_x", {"metric": 10})
+
+    f_one = Finding(
+        finding_id="PG-CHECK:table1",
+        check="check_x",
+        severity=Severity.HIGH,
+        object_type="table",
+        object_name="table1",
+        reason="desc",
+        evidence=[ev_a],
+    )
+    f_two = Finding(
+        finding_id="PG-CHECK:table1",
+        check="check_x",
+        severity=Severity.HIGH,
+        object_type="table",
+        object_name="table1",
+        reason="desc",
+        evidence=[ev_a, ev_a],
+    )
+
+    r_one = _make_report([f_one], audit_id="a1", now=now)
+    r_two = _make_report([f_two], audit_id="a2", now=now)
+
+    diff = compare_audit_reports(r_one, r_two, compared_at=now)
+    assert len(diff.changed_findings) == 1
+    assert len(diff.unchanged_findings) == 0
+
+
+def test_diff_findings_with_empty_evidence():
+    """Findings with empty evidence: [] vs [] is UNCHANGED, [] vs [A] is CHANGED."""
+    now = datetime(2026, 9, 26, 12, 0, 0, tzinfo=timezone.utc)
+    ev_a = _make_evidence("check_x", {"metric": 10})
+
+    f_empty1 = Finding(
+        finding_id="PG-CHECK:table1",
+        check="check_x",
+        severity=Severity.HIGH,
+        object_type="table",
+        object_name="table1",
+        reason="desc",
+        evidence=[],
+    )
+    f_empty2 = Finding(
+        finding_id="PG-CHECK:table1",
+        check="check_x",
+        severity=Severity.HIGH,
+        object_type="table",
+        object_name="table1",
+        reason="desc",
+        evidence=[],
+    )
+    f_with_ev = Finding(
+        finding_id="PG-CHECK:table1",
+        check="check_x",
+        severity=Severity.HIGH,
+        object_type="table",
+        object_name="table1",
+        reason="desc",
+        evidence=[ev_a],
+    )
+
+    r_empty1 = _make_report([f_empty1], audit_id="a1", now=now)
+    r_empty2 = _make_report([f_empty2], audit_id="a2", now=now)
+    r_with_ev = _make_report([f_with_ev], audit_id="a3", now=now)
+
+    # [] vs [] -> UNCHANGED
+    diff_empty = compare_audit_reports(r_empty1, r_empty2, compared_at=now)
+    assert len(diff_empty.unchanged_findings) == 1
+    assert len(diff_empty.changed_findings) == 0
+
+    # [] vs [A] -> CHANGED
+    diff_mod = compare_audit_reports(r_empty1, r_with_ev, compared_at=now)
+    assert len(diff_mod.changed_findings) == 1
+    assert len(diff_mod.unchanged_findings) == 0
