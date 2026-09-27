@@ -8,6 +8,14 @@
       "sessions": 5,
       "memories": 19,
       "prompts": 10
+    },
+    {
+      "id": "838ea05f",
+      "created_by": "cerra",
+      "created_at": "2026-09-27T03:11:32.1396454Z",
+      "sessions": 1,
+      "memories": 1,
+      "prompts": 0
     }
   ]
 }
