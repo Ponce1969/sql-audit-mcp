@@ -12,3 +12,4 @@ wheels/
 .env
 # Local Pi runtime state
 .atl/
+.codegraph/

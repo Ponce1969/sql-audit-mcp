@@ -5,11 +5,11 @@
 [![FastMCP](https://img.shields.io/badge/MCP-FastMCP%20Server-green.svg)](https://modelcontextprotocol.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Powered by uv](https://img.shields.io/badge/packaging-uv-DE5FE9.svg)](https://docs.astral.sh/uv/)
-[![Tests Passing](https://img.shields.io/badge/tests-91%20passed-brightgreen.svg)](tests/)
+[![Tests Passing](https://img.shields.io/badge/tests-133%20passed-brightgreen.svg)](tests/)
 
 A deterministic, zero-hallucination PostgreSQL health and performance auditor designed for production workloads. Runs both as a high-performance standalone CLI and as an on-demand [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for AI coding assistants (Antigravity, Cursor, Claude Desktop, Pi).
 
-Catches silent performance bottlenecks, table-level locking hazards, dead tuple accumulation, broken HOT updates, physical disk bloat, and query execution bottlenecks in sub-second $O(1)$ catalog queries with zero LLM guesswork.
+Catches silent performance bottlenecks, table-level locking hazards, dead tuple accumulation, broken HOT updates, physical disk bloat, and query execution bottlenecks via direct, non-invasive catalog inspection with zero LLM guesswork.
 
 ---
 
@@ -18,7 +18,7 @@ Catches silent performance bottlenecks, table-level locking hazards, dead tuple 
 - **Deterministic Inspection Over Stochastic Triage**: System catalogs (`pg_catalog`, `pg_stat_*`) provide authoritative database-state evidence. No LLM should "guess" whether an index is missing or redundant when PostgreSQL catalogs provide the exact answer in microseconds with zero VRAM overhead.
 - **Canonical Domain Contract**: Standardized `AuditReport`, `Finding`, and `Evidence` schema with deterministic SHA-256 digests. Decouples identity (`finding_id`) from transient observation metrics (`evidence_id`), enabling reliable state tracking across time.
 - **Differential Auditing (Drift Engine)**: Compares current inspection against historical baselines, surfacing `new`, `resolved`, `changed`, and `unchanged` findings to eliminate alert fatigue.
-- **Zero-Downtime Remediation**: Automatically suggests and prepares safe, production-grade DDL migrations (`CREATE INDEX CONCURRENTLY`, `DROP INDEX CONCURRENTLY`) without taking table-level exclusive locks.
+- **Operational Risk Analysis**: Explains architectural principles, table-locking risks, and diagnostic context without prescribing unsafe or automated remediation commands.
 - **Zero-Trust Credential Security**: Credentials and connection strings are resolved strictly on the host/server side (`DATABASE_URL` or `.env`). Passwords never travel over JSON-RPC protocols or touch LLM context windows.
 
 ---
@@ -36,13 +36,13 @@ Catches silent performance bottlenecks, table-level locking hazards, dead tuple 
 | **Low-Usage / Unprofitable Indexes** | `idx_scan / (writes) < 0.05` | Indexes with high maintenance write overhead and negligible read lookups on tables with `> 1,000` writes. |
 
 ### 2. Physical Disk Bloat Estimation (`--bloat` / `pg_bloat`)
-Calculates expected vs. actual disk pages for tables and B-tree indexes based on column alignment, padding, and null bitmaps **without requiring the heavy `pgstattuple` extension**. Provides exact bloat percentages and bytes wasted.
+Calculates expected vs. actual disk pages for tables and B-tree indexes based on column alignment, padding, and null bitmaps **without requiring the heavy `pgstattuple` extension**. Provides statistical bloat estimations (estimated bloat ratio and bytes wasted) derived from catalog metadata.
 
 ### 3. Real-Time Locks & Blocking Tree (`--locks` / `pg_locks`)
-Inspects active lock contention across `pg_locks` and `pg_stat_activity`. Reconstructs the recursive dependency graph, isolates root blocker PIDs, and renders an ASCII blocking tree with wait events and lock modes.
+Inspects active lock contention on-demand using `pg_blocking_pids()` and `pg_stat_activity`. Reconstructs the observed blocking dependency graph, isolates root blocker PIDs, and renders an ASCII blocking tree with wait events and process states.
 
 ### 4. Query Plan Simulation & Bottleneck Detection (`--explain` / `pg_explain`)
-Parses PostgreSQL JSON execution plans to detect sequential scans on large tables, nested loops with high row counts, sort/hash spills to disk (`work_mem` exhaustion), and plan cardinality misestimates. Supports `--analyze` with **safe automatic transaction rollback** (`BEGIN ... ROLLBACK`).
+Parses PostgreSQL JSON execution plans via strictly passive `EXPLAIN (FORMAT JSON, COSTS)` to detect sequential scans on large tables, nested loops with high row counts, sort/hash spills to disk (`work_mem` exhaustion), and plan cardinality misestimates. Does not execute audited queries.
 
 ### 5. Differential Baseline Audit (`--diff <baseline.json>`)
 Compares an existing audit baseline against the live database, isolating newly introduced regressions (+), resolved issues (-), and fluctuating metrics (~).
@@ -78,8 +78,8 @@ sql-audit
 # 2. Explicit connection string
 sql-audit --url "postgresql://user:password@localhost:5432/dbname"
 
-# 3. Filter by schemas and table thresholds
-sql-audit --schema public,analytics --min-table-rows 1000 --min-size 10000000
+# 3. Filter by schemas and table thresholds (defaults: min-table-rows=10000, min-size=0)
+sql-audit --schema public,analytics --min-table-rows 10000 --min-size 10000000
 
 # 4. Canonical JSON output (structured AuditReport contract)
 sql-audit --canonical-json > baseline.json
@@ -93,23 +93,40 @@ sql-audit --locks
 # 7. Physical disk bloat estimation
 sql-audit --bloat --min-bloat-bytes 10000000 --min-bloat-ratio 20.0
 
-# 8. Query plan simulation (syntax / cost analysis)
+# 8. Query plan simulation (syntax / cost analysis via passive EXPLAIN)
 sql-audit --explain "SELECT * FROM orders WHERE total > 100"
 
-# 9. Live query plan execution with buffer stats (SAFE: automatic ROLLBACK)
-sql-audit --explain-file query.sql --analyze
+# 9. Query plan from file (strictly passive EXPLAIN)
+sql-audit --explain-file query.sql
 
 # 10. Quiet mode (summary counts only)
 sql-audit --quiet
 ```
 
+### Canonical Thresholds & Contract
+Both CLI and MCP adapters adhere to the unified canonical contract:
+- `min_table_rows = 10,000`: Tables with fewer live rows are skipped for HOT update efficiency and low-usage checks to eliminate false positives on micro-tables.
+- `min_size_bytes = 0`: All indexes matching redundancy patterns are evaluated regardless of on-disk size.
+
+### Defensive Session Timeouts
+To guarantee that passive inspection never hangs on tables undergoing concurrent maintenance:
+- `statement_timeout = 15,000 ms` (15s): Enforces an upper bound on catalog and plan query duration.
+- `lock_timeout = 3,000 ms` (3s): Prevents waiting in lock queues if concurrent DDL holds `ACCESS EXCLUSIVE`.
+- Configured at connection handshake level across both CLI (`options`) and MCP (`server_settings`).
+
+### Resilient Partial Audit (Fault Isolation)
+Individual health checks execute in isolated sub-transactions:
+- If a specific check encounters a timeout or query error, the failure is logged, recorded in `checks_failed` and `errors`, and `is_partial = True` is flagged on the report.
+- Findings and evidence from all successfully completed checks are preserved intact.
+- A partial audit is explicitly degraded and is never reported as clean/healthy. Global connection failures retain fatal exit semantics.
+
 ### Exit Codes (CI/CD Pipeline Ready)
 | Code | Severity | Description |
 |---|---|---|
-| `0` | **OK** | All checks passed clean (or no active locks / clean bloat / safe query plan). |
-| `1` | **ERROR** | Configuration error, invalid arguments, or database connection failure. |
-| `2` | **WARNING** | Optimization findings present (redundant indexes, low HOT ratio, low-usage indexes, physical bloat, or medium plan warnings). |
-| `3` | **CRITICAL** | Urgent production risks detected (invalid indexes, unindexed foreign keys, excessive dead tuples, active blocking lock contention, or high-risk plan bottlenecks). |
+| `0` | **OK** | All requested checks completed cleanly with zero findings and zero errors. |
+| `1` | **ERROR** | Configuration error, invalid arguments, database connection failure, or fatal initialization error. |
+| `2` | **WARNING** | Optimization findings present (redundant indexes, low HOT ratio, low-usage indexes, physical bloat, medium plan warnings), or degraded/partial audit execution without critical issues (`is_partial = True`). |
+| `3` | **CRITICAL** | Urgent production risks detected (invalid indexes, unindexed foreign keys, excessive dead tuples, active blocking lock contention, high-risk plan bottlenecks), whether in a complete or partial audit run. |
 
 ---
 
@@ -121,7 +138,7 @@ The asynchronous MCP server (`mcp_pg_auditor.py`) is powered by `asyncpg` and `F
 - `pg_health_audit`: Full evaluation of up to 6 performance anti-patterns.
 - `pg_locks`: Real-time inspection of lock contention and visual blocking tree.
 - `pg_bloat`: Physical disk bloat estimation for tables and B-tree indexes.
-- `pg_explain`: Automated query plan bottleneck analysis with safe `EXPLAIN (ANALYZE, BUFFERS)` execution.
+- `pg_explain`: Automated query plan bottleneck analysis via passive `EXPLAIN (FORMAT JSON, COSTS)`.
 
 ### Client Configuration
 
@@ -185,7 +202,8 @@ uv run python audit_pg.py --url "postgresql://user:password@127.0.0.1:5545/dbnam
     - Redundant: ix_pedidos_cliente_id (Size: 16 kB)
     - Covered by: idx_pedido_cliente
     - Redundant def: CREATE INDEX ix_pedidos_cliente_id ON public.pedidos USING btree (cliente_id)
-    - Suggestion: Consider DROP INDEX CONCURRENTLY ix_pedidos_cliente_id;
+    - Diagnostic: Index is a left-prefix duplicate covered by 'idx_pedido_cliente'.
+    - Considerations: Consumes cache and write overhead redundantly; verify query usage and constraint requirements before planning index retirement.
 [5] LOW HOT UPDATE EFFICIENCY: 0
   -> OK: No tables with low HOT update ratio.
 [6] UNPROFITABLE / HIGH-WRITE LOW-READ INDEXES: 0
@@ -235,7 +253,7 @@ Total Estimated Bloat: 85.8 MB
 The test suite covers the full domain contract, catalog queries, locks graph, bloat math, execution plan simulation, and differential drift:
 
 ```bash
-# Run complete test suite (91 unit and integration tests)
+# Run complete test suite (133 unit and integration tests)
 uv run pytest
 
 # Check code formatting and linting
@@ -244,6 +262,13 @@ uv run ruff check .
 # Type checking (strict mode)
 uv run mypy
 ```
+
+---
+
+## Historical Offline Migrations Boundary
+
+> [!NOTE]
+> The `scripts/migrations/` directory contains historical, offline DDL scripts created for specific database cleanups. These scripts are strictly isolated from the passive health auditor engine, are never presented as recommended actions, and are never executed by CLI or FastMCP runtime tools.
 
 ---
 
