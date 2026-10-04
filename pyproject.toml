@@ -34,12 +34,12 @@ package = true
 [dependency-groups]
 dev = [
     "asyncpg>=0.29.0",
-    "fastmcp>=2.0.0",
     "mcp>=1.0.0,<2",
     "mypy>=2.3.1",
     "pydantic>=2.0.0",
     "pytest>=8.0",
     "pytest-asyncio>=0.23.0",
+    "pytest-cov>=7.1.0",
     "ruff>=0.16.8",
     "types-psycopg2>=2.9.21.20260911",
 ]
@@ -47,6 +47,7 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["src", "."]
+addopts = "--cov=src/sql_audit --cov=audit_pg --cov=mcp_pg_auditor --cov-report=term-missing"
 
 [tool.ruff]
 line-length = 100

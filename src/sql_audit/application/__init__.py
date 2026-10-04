@@ -25,6 +25,7 @@ from sql_audit.application.mapping import (
 from sql_audit.application.plan_service import (
     analyze_execution_plan,
     render_plan_report_text,
+    validate_explain_query,
 )
 from sql_audit.domain.models import AuditReport
 
@@ -48,4 +49,5 @@ __all__ = [
     "render_diff_text",
     "render_lock_report_text",
     "render_plan_report_text",
+    "validate_explain_query",
 ]

@@ -263,7 +263,46 @@ def render_plan_report_text(report: PlanAnalysisReport) -> str:
     return "\n".join(lines)
 
 
+def validate_explain_query(query: str) -> str:
+    """Validates that a query string is suitable for passive EXPLAIN analysis.
+
+    Enforces that the query is non-empty, strips a single trailing semicolon,
+    and rejects multi-statement SQL strings containing internal semicolons.
+    """
+    cleaned = query.strip()
+    if not cleaned:
+        raise ValueError("Query string cannot be empty.")
+
+    cleaned = cleaned.rstrip(";").strip()
+    if not cleaned:
+        raise ValueError("Query string cannot be empty.")
+
+    in_single_quote = False
+    in_double_quote = False
+    idx = 0
+    length = len(cleaned)
+
+    while idx < length:
+        ch = cleaned[idx]
+        if ch == "'" and not in_double_quote:
+            if in_single_quote and idx + 1 < length and cleaned[idx + 1] == "'":
+                idx += 2
+                continue
+            in_single_quote = not in_single_quote
+        elif ch == '"' and not in_single_quote:
+            if in_double_quote and idx + 1 < length and cleaned[idx + 1] == '"':
+                idx += 2
+                continue
+            in_double_quote = not in_double_quote
+        elif ch == ";" and not in_single_quote and not in_double_quote:
+            raise ValueError("Multi-statement queries are not allowed in explain_query.")
+        idx += 1
+
+    return cleaned
+
+
 __all__ = [
     "analyze_execution_plan",
     "render_plan_report_text",
+    "validate_explain_query",
 ]

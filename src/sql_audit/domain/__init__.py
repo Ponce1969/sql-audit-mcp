@@ -12,6 +12,19 @@ from sql_audit.domain.diff import (
     FindingLifecycleState,
 )
 from sql_audit.domain.hasher import compute_evidence_id, compute_stable_finding_id
+from sql_audit.domain.issues import (
+    ALL_CHECKS,
+    CHECK_FIELDS,
+    CheckName,
+    DatabaseHealthReport,
+    DeadTuplesIssue,
+    HotUpdateIssue,
+    InvalidIndexIssue,
+    LowUsageIndexIssue,
+    PostgresHealthReport,
+    RedundantIndexIssue,
+    UnindexedFKIssue,
+)
 from sql_audit.domain.locks import (
     BlockingEdge,
     LockContentionReport,
@@ -38,6 +51,9 @@ from sql_audit.domain.plan import (
 )
 
 __all__ = [
+    "ALL_CHECKS",
+    "CHECK_FIELDS",
+    "CheckName",
     "DEFAULT_LOCK_TIMEOUT_MS",
     "DEFAULT_MIN_SIZE_BYTES",
     "DEFAULT_MIN_TABLE_ROWS",
@@ -47,22 +63,30 @@ __all__ = [
     "BlockingEdge",
     "BloatReport",
     "ChangedFinding",
+    "DatabaseHealthReport",
+    "DeadTuplesIssue",
     "DiffSummary",
     "Evidence",
     "ExecutionMetadata",
     "Finding",
     "FindingLifecycleState",
+    "HotUpdateIssue",
     "IndexBloat",
+    "InvalidIndexIssue",
     "JsonValue",
     "LockContentionReport",
     "LockProcess",
     "LockTree",
+    "LowUsageIndexIssue",
     "PlanAnalysisReport",
     "PlanRiskLevel",
     "PlanSummary",
     "PlanWarning",
+    "PostgresHealthReport",
+    "RedundantIndexIssue",
     "Severity",
     "TableBloat",
+    "UnindexedFKIssue",
     "compute_evidence_id",
     "compute_stable_finding_id",
 ]

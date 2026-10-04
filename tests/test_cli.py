@@ -291,3 +291,16 @@ def test_low_usage_query_uses_threshold_1000(monkeypatch):
     assert not re.search(r">\s*100\b(?!0)", sql), (
         "Old threshold > 100 still present in low-usage query"
     )
+
+
+def test_cli_explain_rejects_multistatement(capsys):
+    """CLI --explain rejects multi-statement strings before executing."""
+    exit_code = audit_pg.main([
+        "--url",
+        "postgresql://u:p@localhost:5432/db",
+        "--explain",
+        "SELECT 1; DROP TABLE users;",
+    ])
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert "Invalid query" in captured.err or "Multi-statement" in captured.err

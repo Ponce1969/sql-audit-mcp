@@ -3,11 +3,14 @@
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 import audit_pg
 from mcp_pg_auditor import pg_explain
 from sql_audit.application import (
     analyze_execution_plan,
     render_plan_report_text,
+    validate_explain_query,
 )
 
 
@@ -325,4 +328,60 @@ def test_parser_preserves_compatibility_with_pre_analyzed_plans():
     assert report.is_analyzed is True
     assert report.summary.execution_time_ms == 0.08
     assert report.summary.shared_hit_blocks == 4
+
+
+def test_validate_explain_query_valid():
+    """validate_explain_query accepts single-statement queries and handles semicolons properly."""
+    # Simple query
+    assert validate_explain_query("SELECT 1") == "SELECT 1"
+
+    # Query with trailing semicolon
+    assert validate_explain_query("SELECT * FROM users;") == "SELECT * FROM users"
+    assert validate_explain_query("  SELECT * FROM users;  ") == "SELECT * FROM users"
+
+    # Query with semicolons inside literal quotes
+    query_with_quotes = "SELECT * FROM logs WHERE message = 'semicolon; here'"
+    assert validate_explain_query(query_with_quotes) == query_with_quotes
+
+
+def test_validate_explain_query_rejects_empty_and_multistatement():
+    """validate_explain_query raises ValueError on empty or multi-statement queries."""
+    with pytest.raises(ValueError, match="empty"):
+        validate_explain_query("")
+
+    with pytest.raises(ValueError, match="empty"):
+        validate_explain_query("   ")
+
+    with pytest.raises(ValueError, match="empty"):
+        validate_explain_query(";;;")
+
+    with pytest.raises(ValueError, match="Multi-statement"):
+        validate_explain_query("SELECT 1; DROP TABLE users;")
+
+    with pytest.raises(ValueError, match="Multi-statement"):
+        validate_explain_query("SELECT 1; DELETE FROM logs")
+
+
+def test_plan_engine_detects_low_cache_hit_and_nested_loop():
+    """Detects low cache hit ratio when shared_read >= 2000 and hit_ratio < 80%."""
+    raw_plan = [
+        {
+            "Plan": {
+                "Node Type": "Nested Loop",
+                "Total Cost": 15000.0,
+                "Plan Rows": 100,
+                "Actual Rows": 100,
+                "Actual Loops": 15000,
+                "Actual Total Time": 1200.0,
+                "Shared Hit Blocks": 500,
+                "Shared Read Blocks": 3000,
+                "Plans": [],
+            },
+            "Execution Time": 1250.0,
+        }
+    ]
+    report = analyze_execution_plan(raw_plan, query="SELECT * FROM a JOIN b ON a.id = b.a_id")
+    warning_types = [w.warning_type for w in report.summary.warnings]
+    assert "low_cache_hit_ratio" in warning_types
+    assert "nested_loop_high_loops" in warning_types
 

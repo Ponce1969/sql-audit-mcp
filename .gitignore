@@ -13,3 +13,5 @@ wheels/
 # Local Pi runtime state
 .atl/
 .codegraph/
+.coverage
+.pytest_cache/

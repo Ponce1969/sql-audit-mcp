@@ -5,7 +5,7 @@
 [![FastMCP](https://img.shields.io/badge/MCP-FastMCP%20Server-green.svg)](https://modelcontextprotocol.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Powered by uv](https://img.shields.io/badge/packaging-uv-DE5FE9.svg)](https://docs.astral.sh/uv/)
-[![Tests Passing](https://img.shields.io/badge/tests-139%20passed-brightgreen.svg)](tests/)
+[![Tests Passing](https://img.shields.io/badge/tests-143%20passed-brightgreen.svg)](tests/)
 
 A deterministic, zero-hallucination PostgreSQL health and performance auditor designed for production workloads. Runs both as a high-performance standalone CLI and as an on-demand [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for AI coding assistants (Antigravity, Cursor, Claude Desktop, Pi).
 
@@ -253,7 +253,7 @@ Total Estimated Bloat: 85.8 MB
 The test suite covers the full domain contract, catalog queries, locks graph, bloat math, execution plan simulation, and differential drift:
 
 ```bash
-# Run complete test suite (139 unit and integration tests)
+# Run complete test suite (143 unit and integration tests)
 uv run pytest
 
 # Check code formatting and linting

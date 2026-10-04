@@ -325,6 +325,10 @@ def _extract_row(item: Any) -> dict[str, Any]:
         return item
     if hasattr(item, "model_dump"):
         return dict(item.model_dump())
+    if hasattr(item, "__dataclass_fields__"):
+        from dataclasses import asdict
+
+        return asdict(item)
     return dict(item.__dict__)
 
 

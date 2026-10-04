@@ -1,5 +1,4 @@
-"""Infrastructure layer for SQL Audit."""
-
+from sql_audit.infrastructure.async_auditor import AsyncPostgresHealthAuditor
 from sql_audit.infrastructure.queries import (
     SQL_DEAD_TUPLES_ALL_PSYCOPG,
     SQL_DEAD_TUPLES_ASYNCPG,
@@ -24,8 +23,17 @@ from sql_audit.infrastructure.queries import (
     SQL_UNINDEXED_FKS_ASYNCPG,
     SQL_UNINDEXED_FKS_SCHEMAS_PSYCOPG,
 )
+from sql_audit.infrastructure.sync_auditor import (
+    DEFAULT_CONNECT_TIMEOUT,
+    HAS_PSYCOPG2,
+    DatabaseConnectionError,
+    PostgresHealthAuditor,
+    redact_db_url,
+)
 
 __all__ = [
+    "DEFAULT_CONNECT_TIMEOUT",
+    "HAS_PSYCOPG2",
     "SQL_DEAD_TUPLES_ALL_PSYCOPG",
     "SQL_DEAD_TUPLES_ASYNCPG",
     "SQL_DEAD_TUPLES_SCHEMAS_PSYCOPG",
@@ -48,4 +56,8 @@ __all__ = [
     "SQL_UNINDEXED_FKS_ALL_PSYCOPG",
     "SQL_UNINDEXED_FKS_ASYNCPG",
     "SQL_UNINDEXED_FKS_SCHEMAS_PSYCOPG",
+    "AsyncPostgresHealthAuditor",
+    "DatabaseConnectionError",
+    "PostgresHealthAuditor",
+    "redact_db_url",
 ]
